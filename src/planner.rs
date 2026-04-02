@@ -209,10 +209,10 @@ fn trusted_backends(
             && !backend
                 .attestation
                 .as_ref()
-                .is_some_and(|attestation| attestation.verified)
+                .is_some_and(|attestation| attestation.verified && attestation.signature.is_some())
         {
             reasons.push(format!(
-                "backend {} excluded because verified attestation is required",
+                "backend {} excluded because verified signed attestation is required",
                 backend.name
             ));
             continue;
@@ -308,6 +308,7 @@ mod tests {
                 signer: "test".into(),
                 artifact_hash: format!("sha256:{name}"),
                 verified: true,
+                signature: Some("sig:test".into()),
             }),
             execution_modes: vec![ExecutionMode::Solo, ExecutionMode::RoutedServing],
             model_families: vec!["llama".into()],
@@ -412,6 +413,35 @@ mod tests {
         );
         assert_eq!(report.selected_peers, vec!["good"]);
         assert!(report.reasons.iter().any(|reason| reason.contains("excluded")));
+    }
+
+    #[test]
+    fn excludes_unsigned_attestations_when_strict_correctness_is_required() {
+        let mut unsigned = backend("unsigned", "local", 2, 4096);
+        if let Some(attestation) = unsigned.attestation.as_mut() {
+            attestation.signature = None;
+        }
+        let report = compatibility(
+            &CompatibilityRequest {
+                model_id: "llama-3.2-3b".into(),
+                job_type: JobType::ChatCompletion,
+                peers: vec![],
+                desired_mode: None,
+                determinism: DeterminismPolicy {
+                    strict_correctness: true,
+                    deterministic: true,
+                    low_latency: true,
+                    high_availability: false,
+                },
+            },
+            &[backend("good", "local", 2, 4096), unsigned],
+            &[model()],
+        );
+        assert_eq!(report.selected_peers, vec!["good"]);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("signed attestation")));
     }
 
     #[test]

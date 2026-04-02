@@ -53,7 +53,7 @@ pub fn node_identity(config: &RuntimeConfig) -> NodeIdentity {
             .unwrap_or_else(|| "0.1.0".into()),
         transports: vec!["in_process".into(), "tcp".into(), "quic".into()],
         trust_level: TrustLevel::TrustedExecutor,
-        auth_modes: vec![AuthMode::None, AuthMode::SharedToken],
+        auth_modes: vec![AuthMode::None, AuthMode::SharedToken, AuthMode::SignedNodeIdentity],
         hardware: HardwareProfile {
             architecture: std::env::consts::ARCH.into(),
             accelerator: if cfg!(target_os = "macos") {
@@ -193,6 +193,7 @@ fn default_descriptor(name: &str) -> BackendDescriptor {
             signer: "zeitgeist-synthetic".into(),
             artifact_hash: format!("sha256:synthetic-{name}"),
             verified: true,
+            signature: Some("sig:verified".into()),
         }),
         execution_modes: vec![ExecutionMode::Solo, ExecutionMode::RoutedServing],
         model_families: vec!["llama".into()],

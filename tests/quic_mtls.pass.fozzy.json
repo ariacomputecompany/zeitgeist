@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "quic-mtls-pass",
+  "steps": [
+    {
+      "type": "proc_when",
+      "cmd": "sh",
+      "args": [
+        "-lc",
+        "set -eu\nTMPDIR=$(mktemp -d)\ncat >\"$TMPDIR/ca.cnf\" <<'EOF'\n[req]\ndefault_bits = 2048\nprompt = no\ndefault_md = sha256\ndistinguished_name = dn\nx509_extensions = v3_ca\n\n[dn]\nCN = zeitgeist-test-ca\n\n[v3_ca]\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always,issuer\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,keyCertSign,cRLSign\nEOF\ncat >\"$TMPDIR/server.cnf\" <<'EOF'\n[req]\ndefault_bits = 2048\nprompt = no\ndefault_md = sha256\ndistinguished_name = dn\nreq_extensions = v3_req\n\n[dn]\nCN = localhost\n\n[v3_req]\nsubjectAltName = @alt_names\nbasicConstraints = critical,CA:FALSE\nkeyUsage = critical,digitalSignature,keyEncipherment\nextendedKeyUsage = serverAuth\n\n[alt_names]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\nEOF\ncat >\"$TMPDIR/client.cnf\" <<'EOF'\n[req]\ndefault_bits = 2048\nprompt = no\ndefault_md = sha256\ndistinguished_name = dn\nreq_extensions = v3_req\n\n[dn]\nCN = zeitgeist-client\n\n[v3_req]\nbasicConstraints = critical,CA:FALSE\nkeyUsage = critical,digitalSignature,keyEncipherment\nextendedKeyUsage = clientAuth\nEOF\nopenssl req -x509 -nodes -newkey rsa:2048 -keyout \"$TMPDIR/ca-key.pem\" -out \"$TMPDIR/ca-cert.pem\" -days 1 -config \"$TMPDIR/ca.cnf\" >/dev/null 2>&1\nopenssl req -nodes -newkey rsa:2048 -keyout \"$TMPDIR/server-key.pem\" -out \"$TMPDIR/server.csr\" -config \"$TMPDIR/server.cnf\" >/dev/null 2>&1\nopenssl x509 -req -in \"$TMPDIR/server.csr\" -CA \"$TMPDIR/ca-cert.pem\" -CAkey \"$TMPDIR/ca-key.pem\" -CAcreateserial -out \"$TMPDIR/server-cert.pem\" -days 1 -sha256 -extfile \"$TMPDIR/server.cnf\" -extensions v3_req >/dev/null 2>&1\nopenssl req -nodes -newkey rsa:2048 -keyout \"$TMPDIR/client-key.pem\" -out \"$TMPDIR/client.csr\" -config \"$TMPDIR/client.cnf\" >/dev/null 2>&1\nopenssl x509 -req -in \"$TMPDIR/client.csr\" -CA \"$TMPDIR/ca-cert.pem\" -CAkey \"$TMPDIR/ca-key.pem\" -CAcreateserial -out \"$TMPDIR/client-cert.pem\" -days 1 -sha256 -extfile \"$TMPDIR/client.cnf\" -extensions v3_req >/dev/null 2>&1\ncargo run --quiet -- serve-peer-quic --bind 127.0.0.1:9553 --cert \"$TMPDIR/server-cert.pem\" --key \"$TMPDIR/server-key.pem\" --client-ca-cert \"$TMPDIR/ca-cert.pem\" >\"$TMPDIR/server.log\" 2>&1 &\nSERVER_PID=$!\ntrap 'kill \"$SERVER_PID\" >/dev/null 2>&1 || true; rm -rf \"$TMPDIR\"' EXIT\nsleep 2\ncargo run --quiet -- peer-ping-quic --addr 127.0.0.1:9553 --server-name localhost --ca-cert \"$TMPDIR/ca-cert.pem\" --client-cert \"$TMPDIR/client-cert.pem\" --client-key \"$TMPDIR/client-key.pem\" >\"$TMPDIR/ping.json\"\nTMPDIR_PATH=\"$TMPDIR\" python3 - <<'PY'\nimport json, os, pathlib\npayload = json.loads(pathlib.Path(os.environ['TMPDIR_PATH'], 'ping.json').read_text())\nassert payload['type'] == 'handshake_accepted', payload\nassert payload['protocol_version'] == '0.1.0', payload\nPY"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "",
+      "times": 1
+    }
+  ]
+}

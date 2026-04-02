@@ -4,6 +4,9 @@ use crate::{
     types::*,
 };
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
@@ -76,6 +79,66 @@ impl Runtime {
 
     pub fn auth_token(&self) -> Option<&str> {
         self.inner.auth_token.as_deref()
+    }
+
+
+    pub fn signed_identity_for(&self, node_id: &str) -> SignedIdentity {
+        let signing_key = self.signing_key();
+        let public_key = signing_key.verifying_key();
+        let payload = self.peer_identity_payload(node_id, self.protocol_version());
+        let signature = signing_key.sign(payload.as_bytes());
+        SignedIdentity {
+            algorithm: "ed25519".into(),
+            public_key: BASE64.encode(public_key.as_bytes()),
+            signature: BASE64.encode(signature.to_bytes()),
+        }
+    }
+
+    pub fn verify_signed_identity(
+        &self,
+        node_id: &str,
+        protocol_version: &str,
+        signed_identity: Option<&SignedIdentity>,
+    ) -> Result<()> {
+        let signed_identity = signed_identity.ok_or_else(|| anyhow!("missing signed node identity"))?;
+        if signed_identity.algorithm != "ed25519" {
+            return Err(anyhow!("unsupported signed identity algorithm {}", signed_identity.algorithm));
+        }
+        let public_key_bytes = BASE64
+            .decode(&signed_identity.public_key)
+            .map_err(|error| anyhow!("invalid signed identity public key: {}", error))?;
+        let public_key_array: [u8; 32] = public_key_bytes
+            .try_into()
+            .map_err(|_| anyhow!("signed identity public key must be 32 bytes"))?;
+        let verifying_key = VerifyingKey::from_bytes(&public_key_array)?;
+        let signature_bytes = BASE64
+            .decode(&signed_identity.signature)
+            .map_err(|error| anyhow!("invalid signed identity signature: {}", error))?;
+        let signature_array: [u8; 64] = signature_bytes
+            .try_into()
+            .map_err(|_| anyhow!("signed identity signature must be 64 bytes"))?;
+        let signature = Signature::from_bytes(&signature_array);
+        let payload = self.peer_identity_payload(node_id, protocol_version);
+        verifying_key
+            .verify(payload.as_bytes(), &signature)
+            .map_err(|error| anyhow!("signed identity verification failed: {}", error))?;
+        Ok(())
+    }
+
+    fn signing_key(&self) -> SigningKey {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zeitgeist-peer-signing");
+        hasher.update(self.inner.node.node_id.as_bytes());
+        hasher.update(self.protocol_version().as_bytes());
+        if let Some(token) = self.auth_token() {
+            hasher.update(token.as_bytes());
+        }
+        let seed: [u8; 32] = hasher.finalize().into();
+        SigningKey::from_bytes(&seed)
+    }
+
+    fn peer_identity_payload(&self, node_id: &str, protocol_version: &str) -> String {
+        format!("zeitgeist-peer:{}:{}", node_id, protocol_version)
     }
 
     pub fn compatibility(&self, request: &CompatibilityRequest) -> CompatibilityReport {

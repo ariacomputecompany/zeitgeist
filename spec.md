@@ -1093,9 +1093,9 @@ This checklist is the current source-of-truth status against this spec.
 
 - ✅ Auth mode and trust level types exist.
 - ✅ Enforced shared-token auth.
-- ⬜ mTLS.
-- ⬜ Signed node identity.
-- ⬜ Backend attestation.
+- ✅ mTLS.
+- ✅ Signed node identity.
+- ✅ Backend attestation.
 
 ### 26.11 Modular Backend and Kernel Architecture
 

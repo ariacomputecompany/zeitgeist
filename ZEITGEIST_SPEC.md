@@ -13,6 +13,14 @@ This document is the normative implementation companion to [spec.md](/Users/deep
 
 - Auth modes modeled: `none`, `shared_token`, `mutual_tls`, `signed_node_identity`, `backend_signed_attestation`, `extension`
 - Enforced auth mode in this repo: `shared_token` when `auth_token` is configured
+- Enforced peer trust in this repo:
+  - signed node identity on peer handshakes
+  - backend attestation signature required for strict planning
+  - mutual TLS on QUIC when `--client-ca-cert` is configured on the server and client cert/key are provided by the caller
+- Enforced peer trust in this repo:
+  - signed node identity on peer handshakes
+  - backend attestation signature required for strict planning
+  - mutual TLS on QUIC when `--client-ca-cert` is configured on the server and the client presents a certificate/key pair
 - Shared token header:
   - `Authorization: Bearer <token>`
 - Peer transport auth field:
@@ -47,9 +55,13 @@ This document is the normative implementation companion to [spec.md](/Users/deep
 
 - `serve-peer` starts the node-to-node TCP listener
 - `serve-peer-quic` starts the node-to-node QUIC listener and requires a certificate/key pair
+- `serve-peer-quic` can also require client certificates with `--client-ca-cert`
+- `serve-peer-quic` can also require client certificates with `--client-ca-cert`
 - `serve-peer-unix` starts the node-to-node Unix domain socket listener
 - `peer-ping` performs an exact-version authenticated handshake
 - `peer-ping-quic` performs an exact-version authenticated QUIC handshake with certificate validation
+- `peer-ping-quic` can also present a client certificate and key for QUIC mTLS
+- `peer-ping-quic` can also present a client certificate and key for QUIC mTLS
 - `peer-ping-unix` performs an exact-version authenticated Unix-socket handshake
 - `peer-capabilities-quic` queries capabilities over QUIC
 - `peer-execute-quic` executes a remote job over QUIC

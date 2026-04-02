@@ -122,6 +122,13 @@ pub struct NodeIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SignedIdentity {
+    pub algorithm: String,
+    pub public_key: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CacheDescriptor {
     pub version: String,
     pub dtype: DType,
@@ -203,6 +210,7 @@ pub struct BackendAttestation {
     pub signer: String,
     pub artifact_hash: String,
     pub verified: bool,
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

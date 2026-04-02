@@ -29,6 +29,8 @@ enum Command {
         cert: PathBuf,
         #[arg(long)]
         key: PathBuf,
+        #[arg(long)]
+        client_ca_cert: Option<PathBuf>,
     },
     ServePeerUnix {
         #[arg(long, default_value = "/tmp/zeitgeist-peer.sock")]
@@ -57,6 +59,10 @@ enum Command {
         server_name: String,
         #[arg(long)]
         ca_cert: PathBuf,
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
+        #[arg(long)]
+        client_key: Option<PathBuf>,
     },
     PeerPingUnix {
         #[arg(long, default_value = "/tmp/zeitgeist-peer.sock")]
@@ -69,6 +75,10 @@ enum Command {
         server_name: String,
         #[arg(long)]
         ca_cert: PathBuf,
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
+        #[arg(long)]
+        client_key: Option<PathBuf>,
     },
     PeerExecute {
         #[arg(long, default_value = "127.0.0.1:9090")]
@@ -83,6 +93,10 @@ enum Command {
         server_name: String,
         #[arg(long)]
         ca_cert: PathBuf,
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
+        #[arg(long)]
+        client_key: Option<PathBuf>,
         #[arg(long, default_value = "remote execute")]
         prompt: String,
     },
@@ -109,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { bind } => api::serve(runtime, &bind).await,
         Command::ServePeer { bind } => peer::serve(runtime, &bind).await,
-        Command::ServePeerQuic { bind, cert, key } => peer::serve_quic(runtime, &bind, &cert, &key).await,
+        Command::ServePeerQuic { bind, cert, key, client_ca_cert } => peer::serve_quic(runtime, &bind, &cert, &key, client_ca_cert.as_deref()).await,
         Command::ServePeerUnix { path } => peer::serve_unix(runtime, &path).await,
         Command::Describe { pretty } => {
             let payload = runtime.capabilities();
@@ -155,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
                     protocol_version: runtime.protocol_version().to_string(),
                     auth_token: runtime.auth_token().map(|token| token.to_string()),
                     node_id: "zeitgeist-cli".into(),
+                    signed_identity: Some(runtime.signed_identity_for("zeitgeist-cli")),
                 },
             )
             .await?;
@@ -173,11 +188,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         }
-        Command::PeerCapabilitiesQuic { addr, server_name, ca_cert } => {
+        Command::PeerCapabilitiesQuic { addr, server_name, ca_cert, client_cert, client_key } => {
             let response = peer::send_quic(
                 &addr,
                 &server_name,
                 &ca_cert,
+                client_cert.as_deref(),
+                client_key.as_deref(),
                 &peer::PeerRequest::Capabilities {
                     protocol_version: runtime.protocol_version().to_string(),
                     auth_token: runtime.auth_token().map(|token| token.to_string()),
@@ -194,21 +211,25 @@ async fn main() -> anyhow::Result<()> {
                     protocol_version: runtime.protocol_version().to_string(),
                     auth_token: runtime.auth_token().map(|token| token.to_string()),
                     node_id: "zeitgeist-cli".into(),
+                    signed_identity: Some(runtime.signed_identity_for("zeitgeist-cli")),
                 },
             )
             .await?;
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         }
-        Command::PeerPingQuic { addr, server_name, ca_cert } => {
+        Command::PeerPingQuic { addr, server_name, ca_cert, client_cert, client_key } => {
             let response = peer::send_quic(
                 &addr,
                 &server_name,
                 &ca_cert,
+                client_cert.as_deref(),
+                client_key.as_deref(),
                 &peer::PeerRequest::Handshake {
                     protocol_version: runtime.protocol_version().to_string(),
                     auth_token: runtime.auth_token().map(|token| token.to_string()),
                     node_id: "zeitgeist-cli".into(),
+                    signed_identity: Some(runtime.signed_identity_for("zeitgeist-cli")),
                 },
             )
             .await?;
@@ -242,11 +263,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         }
-        Command::PeerExecuteQuic { addr, server_name, ca_cert, prompt } => {
+        Command::PeerExecuteQuic { addr, server_name, ca_cert, client_cert, client_key, prompt } => {
             let response = peer::send_quic(
                 &addr,
                 &server_name,
                 &ca_cert,
+                client_cert.as_deref(),
+                client_key.as_deref(),
                 &peer::PeerRequest::ExecuteJob {
                     protocol_version: runtime.protocol_version().to_string(),
                     auth_token: runtime.auth_token().map(|token| token.to_string()),
