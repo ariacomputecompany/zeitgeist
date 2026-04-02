@@ -380,13 +380,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{backend::default_backends, config};
+    use crate::{backend::synthetic_backends, config};
     use rcgen::generate_simple_self_signed;
 
     fn test_runtime() -> Runtime {
         Runtime::new(
             config::node_identity(&Default::default()),
-            default_backends(),
+            synthetic_backends(),
             config::models(),
             config::kernels(),
             Some("peer-secret".into()),

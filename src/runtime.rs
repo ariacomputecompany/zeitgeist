@@ -850,10 +850,17 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::{
-        backend::{default_backends, SyntheticBackend},
+        backend::{synthetic_backends, SyntheticBackend},
         config,
     };
     use std::{collections::BTreeMap, sync::Arc};
+
+    fn synthetic_descriptors() -> Vec<BackendDescriptor> {
+        synthetic_backends()
+            .into_iter()
+            .map(|backend| backend.descriptor())
+            .collect()
+    }
 
     fn custom_model(parameter_count: u64, expert_count: Option<u32>) -> ModelIdentity {
         ModelIdentity {
@@ -888,7 +895,7 @@ mod tests {
     async fn synthetic_job_completes() {
         let runtime = Runtime::new(
             config::node_identity(&Default::default()),
-            default_backends(),
+            synthetic_backends(),
             config::models(),
             config::kernels(),
             None,
@@ -916,10 +923,11 @@ mod tests {
 
     #[tokio::test]
     async fn recovers_to_alternate_backend_when_primary_fails() {
-        let mut failing = config::backends(&Default::default())[0].descriptor();
+        let mut descriptors = synthetic_descriptors();
+        let mut failing = descriptors.remove(0);
         failing.name = "mlx".into();
         failing.metadata = BTreeMap::from([("force_fail".into(), "always".into())]);
-        let mut alternate = config::backends(&Default::default())[1].descriptor();
+        let mut alternate = descriptors.remove(0);
         alternate.name = "vllm".into();
 
         let runtime = Runtime::new(
@@ -958,10 +966,11 @@ mod tests {
 
     #[tokio::test]
     async fn degrades_to_fallback_backend_even_when_only_primary_is_requested() {
-        let mut failing = config::backends(&Default::default())[0].descriptor();
+        let mut descriptors = synthetic_descriptors();
+        let mut failing = descriptors.remove(0);
         failing.name = "mlx".into();
         failing.metadata = BTreeMap::from([("force_fail".into(), "always".into())]);
-        let mut fallback = config::backends(&Default::default())[1].descriptor();
+        let mut fallback = descriptors.remove(0);
         fallback.name = "vllm".into();
 
         let runtime = Runtime::new(
@@ -1000,7 +1009,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_same_peer_for_transient_failure() {
-        let mut transient = config::backends(&Default::default())[0].descriptor();
+        let mut transient = synthetic_descriptors().remove(0);
         transient.name = "mlx".into();
         transient.metadata = BTreeMap::from([("force_fail".into(), "once".into())]);
 
@@ -1038,10 +1047,11 @@ mod tests {
 
     #[tokio::test]
     async fn tensor_parallel_execution_runs_across_multiple_participants() {
-        let mut mlx = config::backends(&Default::default())[0].descriptor();
+        let mut descriptors = synthetic_descriptors();
+        let mut mlx = descriptors.remove(0);
         mlx.name = "mlx".into();
         mlx.memory_budget_mb = 24 * 1024;
-        let mut vllm = config::backends(&Default::default())[1].descriptor();
+        let mut vllm = descriptors.remove(0);
         vllm.name = "vllm".into();
         vllm.memory_budget_mb = 24 * 1024;
 
@@ -1082,10 +1092,11 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_execution_runs_for_expert_models() {
-        let mut mlx = config::backends(&Default::default())[0].descriptor();
+        let mut descriptors = synthetic_descriptors();
+        let mut mlx = descriptors.remove(0);
         mlx.name = "mlx".into();
         mlx.memory_budget_mb = 24 * 1024;
-        let mut vllm = config::backends(&Default::default())[1].descriptor();
+        let mut vllm = descriptors.remove(0);
         vllm.name = "vllm".into();
         vllm.memory_budget_mb = 24 * 1024;
 
@@ -1125,11 +1136,12 @@ mod tests {
 
     #[tokio::test]
     async fn replans_after_partial_distributed_failure() {
-        let mut failing = config::backends(&Default::default())[0].descriptor();
+        let mut descriptors = synthetic_descriptors();
+        let mut failing = descriptors.remove(0);
         failing.name = "mlx".into();
         failing.memory_budget_mb = 8 * 1024;
         failing.metadata = BTreeMap::from([("force_fail".into(), "always".into())]);
-        let mut fallback = config::backends(&Default::default())[1].descriptor();
+        let mut fallback = descriptors.remove(0);
         fallback.name = "vllm".into();
         fallback.memory_budget_mb = 8 * 1024;
 

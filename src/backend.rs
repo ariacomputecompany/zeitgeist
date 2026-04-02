@@ -347,6 +347,29 @@ impl BackendAdapter for VllmBackend {
 }
 
 pub fn default_backends() -> Vec<SharedBackend> {
+    let mlx_python = std::env::var("ZEITGEIST_MLX_PYTHON")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "python3".into());
+    let mlx_model = std::env::var("ZEITGEIST_MLX_MODEL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "mlx-community/Llama-3.2-1B-Instruct-4bit".into());
+    let vllm_base_url = std::env::var("ZEITGEIST_VLLM_BASE_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8000".into());
+    let vllm_api_key = std::env::var("ZEITGEIST_VLLM_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+
+    vec![
+        Arc::new(MlxBackend::new(mlx_python, mlx_model)) as SharedBackend,
+        Arc::new(VllmBackend::new(vllm_base_url, vllm_api_key)) as SharedBackend,
+    ]
+}
+
+pub fn synthetic_backends() -> Vec<SharedBackend> {
     let mlx = SyntheticBackend::new(MlxBackend::new("python3".into(), "mlx-community/Llama-3.2-1B-Instruct-4bit".into()).descriptor());
     let vllm = SyntheticBackend::new(VllmBackend::new("http://127.0.0.1:8000".into(), None).descriptor());
     vec![Arc::new(mlx), Arc::new(vllm)]

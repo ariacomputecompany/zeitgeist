@@ -327,12 +327,12 @@ impl<T> Pipe for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{backend::default_backends, config};
+    use crate::{backend::synthetic_backends, config};
 
     fn test_runtime() -> Runtime {
         Runtime::new(
             config::node_identity(&Default::default()),
-            default_backends(),
+            synthetic_backends(),
             config::models(),
             config::kernels(),
             None,
@@ -490,7 +490,7 @@ mod tests {
     async fn shared_token_is_enforced_when_configured() {
         let runtime = Runtime::new(
             config::node_identity(&Default::default()),
-            default_backends(),
+            synthetic_backends(),
             config::models(),
             config::kernels(),
             Some("secret-token".into()),

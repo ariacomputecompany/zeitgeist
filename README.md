@@ -2,13 +2,13 @@
 
 Zeitgeist is a runtime for a backend-neutral distributed inference protocol.
 
-It includes typed protocol objects, compatibility and planning logic, backend adapters, HTTP APIs, peer transports, and a deterministic test setup for validating the runtime without requiring real model servers.
+It includes typed protocol objects, compatibility and planning logic, backend adapters, HTTP APIs, peer transports, and deterministic certification paths for validating the runtime alongside live model execution.
 
 ## Features
 
 - Typed protocol objects for nodes, backends, models, kernels, tensors, cache blobs, jobs, sessions, and events
 - Compatibility reporting and execution planning with topology-aware cost ordering, trust-aware backend exclusion, and memory-pressure-aware repartitioning
-- Backend adapters for `mlx` and `vllm`
+- Live backend adapters for `mlx` and `vllm`
 - HTTP API for discovery, planning, execution, events, and runtime inspection
 - Peer transport over TCP, QUIC, and Unix domain sockets
 - Signed peer identity on handshake and certificate-validated QUIC mTLS when configured
@@ -16,7 +16,7 @@ It includes typed protocol objects, compatibility and planning logic, backend ad
 - Solo, tensor-parallel, expert-parallel, and hybrid distributed execution modes
 - Per-attempt execution telemetry on job records
 - Same-peer retry, active replan, failover, and fallback execution
-- Deterministic synthetic mode for local testing
+- Deterministic synthetic mode as an explicit opt-in for testing and certification
 
 ## CLI
 
@@ -65,7 +65,18 @@ cargo run -- peer-execute --addr 127.0.0.1:9090 --prompt "remote execute"
 
 ## Config
 
-The default config is in [zeitgeist.toml](/Users/deepsaint/Desktop/zeitgeist/zeitgeist.toml). By default the runtime uses synthetic `mlx` and `vllm` backends and a shared dev token.
+The default config is in [zeitgeist.toml](/Users/deepsaint/Desktop/zeitgeist/zeitgeist.toml). By default the runtime uses live `mlx` and live `vllm` backends plus a shared dev token.
+
+If no config file is supplied, the runtime also defaults to live backends and reads:
+
+- `ZEITGEIST_MLX_PYTHON` or `python3`
+- `ZEITGEIST_MLX_MODEL` or `mlx-community/Llama-3.2-1B-Instruct-4bit`
+- `ZEITGEIST_VLLM_BASE_URL` or `http://127.0.0.1:8000`
+- `ZEITGEIST_VLLM_API_KEY` when the upstream OpenAI-compatible server requires auth
+
+Synthetic execution remains available only through explicit `kind = "synthetic"` backend entries in the runtime config.
+
+The checked-in `vllm` backend assumes a live upstream server is reachable at `http://127.0.0.1:8000`.
 
 Protocol matching is strict:
 

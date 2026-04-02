@@ -1100,6 +1100,7 @@ This checklist is the current source-of-truth status against this spec.
 ### 26.11 Modular Backend and Kernel Architecture
 
 - ✅ Backend adapter trait.
+- ✅ Live backends are the shipped default runtime path.
 - ✅ Synthetic backend for deterministic certification.
 - ✅ MLX-shaped adapter.
 - ✅ vLLM OpenAI-compatible proxy-shaped adapter.
@@ -1176,3 +1177,4 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Quilt Linux vLLM installation/import verification.
 - ✅ Live MLX end-to-end inference through the real adapter.
 - ✅ Live vLLM end-to-end inference through a real remote server.
+- ✅ Live default-config vLLM job execution through the Rust runtime.
