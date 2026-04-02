@@ -1,0 +1,11 @@
+node_id = "zeitgeist-local-dev"
+protocol_version = "0.1.0"
+auth_token = "dev-token"
+
+[[backends]]
+kind = "synthetic"
+name = "mlx"
+
+[[backends]]
+kind = "synthetic"
+name = "vllm"

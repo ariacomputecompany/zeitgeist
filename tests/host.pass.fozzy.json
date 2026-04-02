@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "name": "host-pass",
+  "steps": [
+    { "type": "fs_write", "path": "tmp/host-smoke.txt", "data": "zeitgeist-host" },
+    { "type": "fs_read_assert", "path": "tmp/host-smoke.txt", "equals": "zeitgeist-host" },
+    {
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": ["run", "--quiet", "--", "describe"],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "cargo",
+      "args": ["run", "--quiet", "--", "describe"],
+      "expect_exit": 0
+    },
+    {
+      "type": "http_when",
+      "method": "GET",
+      "path": "http://127.0.0.1:18080/healthz",
+      "status": 200,
+      "json": { "ok": true },
+      "times": 1
+    },
+    {
+      "type": "http_request",
+      "method": "GET",
+      "path": "http://127.0.0.1:18080/healthz",
+      "expect_status": 200,
+      "expect_json": { "ok": true }
+    },
+    {
+      "type": "http_when",
+      "method": "GET",
+      "path": "http://127.0.0.1:18080/v1/version-policy",
+      "status": 200,
+      "json": {
+        "compatibility_mode": "exact_only",
+        "backwards_compatibility": false,
+        "protocol_version": "0.1.0"
+      },
+      "times": 1
+    },
+    {
+      "type": "http_request",
+      "method": "GET",
+      "path": "http://127.0.0.1:18080/v1/version-policy",
+      "expect_status": 200,
+      "expect_json": {
+        "compatibility_mode": "exact_only",
+        "backwards_compatibility": false,
+        "protocol_version": "0.1.0"
+      }
+    },
+    {
+      "type": "http_when",
+      "method": "GET",
+      "path": "http://127.0.0.1:18080/v1/transport-health",
+      "status": 200,
+      "json": [
+        {
+          "name": "in_process",
+          "status": "healthy",
+          "latency_class": "ultra_low",
+          "notes": "reference runtime local execution path"
+        },
+        {
+          "name": "http_management",
+          "status": "healthy",
+          "latency_class": "low",
+          "notes": "axum control plane surface"
+        },
+        {
+          "name": "tcp_peer",
+          "status": "healthy",
+          "latency_class": "low",
+          "notes": "peer negotiation, planning, and remote execution supported"
+        },
+        {
+          "name": "quic_peer",
+          "status": "healthy",
+          "latency_class": "low",
+          "notes": "peer negotiation, planning, and remote execution supported over QUIC"
+        },
+        {
+          "name": "unix_peer",
+          "status": "healthy",
+          "latency_class": "ultra_low",
+          "notes": "unix domain socket peer transport supported"
+        }
+      ],
+      "times": 1
+    },
+    {
+      "type": "http_request",
+      "method": "GET",
+      "path": "http://127.0.0.1:18080/v1/transport-health",
+      "expect_status": 200,
+      "expect_json": [
+        {
+          "name": "in_process",
+          "status": "healthy",
+          "latency_class": "ultra_low",
+          "notes": "reference runtime local execution path"
+        },
+        {
+          "name": "http_management",
+          "status": "healthy",
+          "latency_class": "low",
+          "notes": "axum control plane surface"
+        },
+        {
+          "name": "tcp_peer",
+          "status": "healthy",
+          "latency_class": "low",
+          "notes": "peer negotiation, planning, and remote execution supported"
+        },
+        {
+          "name": "quic_peer",
+          "status": "healthy",
+          "latency_class": "low",
+          "notes": "peer negotiation, planning, and remote execution supported over QUIC"
+        },
+        {
+          "name": "unix_peer",
+          "status": "healthy",
+          "latency_class": "ultra_low",
+          "notes": "unix domain socket peer transport supported"
+        }
+      ]
+    }
+  ]
+}

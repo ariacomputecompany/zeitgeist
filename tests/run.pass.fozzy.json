@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "run-pass",
+  "steps": [
+    { "type": "trace_event", "name": "zeitgeist-smoke-start" },
+    {
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": ["run", "--quiet", "--", "smoke", "--prompt", "mesh prompt"],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "cargo",
+      "args": ["run", "--quiet", "--", "smoke", "--prompt", "mesh prompt"],
+      "expect_exit": 0
+    }
+  ]
+}

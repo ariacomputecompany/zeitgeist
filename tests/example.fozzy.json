@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "example",
+  "steps": [
+    {
+      "type": "trace_event",
+      "name": "zeitgeist-example",
+      "fields": {}
+    },
+    {
+      "type": "assert_eq_int",
+      "a": 1,
+      "b": 1,
+      "msg": null
+    }
+  ]
+}

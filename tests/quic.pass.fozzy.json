@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "quic-pass",
+  "steps": [
+    {
+      "type": "proc_when",
+      "cmd": "sh",
+      "args": [
+        "-lc",
+        "set -eu\nTMPDIR=$(mktemp -d)\ncat >\"$TMPDIR/openssl.cnf\" <<'EOF'\n[req]\ndefault_bits = 2048\nprompt = no\ndefault_md = sha256\ndistinguished_name = dn\nx509_extensions = v3_req\n\n[dn]\nCN = localhost\n\n[v3_req]\nsubjectAltName = @alt_names\nbasicConstraints = critical,CA:FALSE\nkeyUsage = critical,digitalSignature,keyEncipherment\nextendedKeyUsage = serverAuth\n\n[alt_names]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\nEOF\nopenssl req -x509 -nodes -newkey rsa:2048 -keyout \"$TMPDIR/key.pem\" -out \"$TMPDIR/cert.pem\" -days 1 -config \"$TMPDIR/openssl.cnf\" >/dev/null 2>&1\ncargo run --quiet -- serve-peer-quic --bind 127.0.0.1:9443 --cert \"$TMPDIR/cert.pem\" --key \"$TMPDIR/key.pem\" >\"$TMPDIR/server.log\" 2>&1 &\nSERVER_PID=$!\ntrap 'kill \"$SERVER_PID\" >/dev/null 2>&1 || true; rm -rf \"$TMPDIR\"' EXIT\nsleep 2\ncargo run --quiet -- peer-ping-quic --addr 127.0.0.1:9443 --server-name localhost --ca-cert \"$TMPDIR/cert.pem\" >\"$TMPDIR/ping.json\"\nTMPDIR_PATH=\"$TMPDIR\" python3 - <<'PY'\nimport json, os, pathlib\npayload = json.loads(pathlib.Path(os.environ[\"TMPDIR_PATH\"], \"ping.json\").read_text())\nassert payload[\"type\"] == \"handshake_accepted\", payload\nassert payload[\"protocol_version\"] == \"0.1.0\", payload\nPY\ncargo run --quiet -- peer-execute-quic --addr 127.0.0.1:9443 --server-name localhost --ca-cert \"$TMPDIR/cert.pem\" --prompt 'fozzy quic execute' >\"$TMPDIR/execute.json\"\nTMPDIR_PATH=\"$TMPDIR\" python3 - <<'PY'\nimport json, os, pathlib\npayload = json.loads(pathlib.Path(os.environ[\"TMPDIR_PATH\"], \"execute.json\").read_text())\nassert payload[\"type\"] == \"execute_job\", payload\nassert payload[\"record\"][\"status\"] in {\"completed\", \"recovered\"}, payload\nassert payload[\"record\"][\"result\"][\"backend\"] == \"mlx\", payload\nPY"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "sh",
+      "args": [
+        "-lc",
+        "set -eu\nTMPDIR=$(mktemp -d)\ncat >\"$TMPDIR/openssl.cnf\" <<'EOF'\n[req]\ndefault_bits = 2048\nprompt = no\ndefault_md = sha256\ndistinguished_name = dn\nx509_extensions = v3_req\n\n[dn]\nCN = localhost\n\n[v3_req]\nsubjectAltName = @alt_names\nbasicConstraints = critical,CA:FALSE\nkeyUsage = critical,digitalSignature,keyEncipherment\nextendedKeyUsage = serverAuth\n\n[alt_names]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\nEOF\nopenssl req -x509 -nodes -newkey rsa:2048 -keyout \"$TMPDIR/key.pem\" -out \"$TMPDIR/cert.pem\" -days 1 -config \"$TMPDIR/openssl.cnf\" >/dev/null 2>&1\ncargo run --quiet -- serve-peer-quic --bind 127.0.0.1:9443 --cert \"$TMPDIR/cert.pem\" --key \"$TMPDIR/key.pem\" >\"$TMPDIR/server.log\" 2>&1 &\nSERVER_PID=$!\ntrap 'kill \"$SERVER_PID\" >/dev/null 2>&1 || true; rm -rf \"$TMPDIR\"' EXIT\nsleep 2\ncargo run --quiet -- peer-ping-quic --addr 127.0.0.1:9443 --server-name localhost --ca-cert \"$TMPDIR/cert.pem\" >\"$TMPDIR/ping.json\"\nTMPDIR_PATH=\"$TMPDIR\" python3 - <<'PY'\nimport json, os, pathlib\npayload = json.loads(pathlib.Path(os.environ[\"TMPDIR_PATH\"], \"ping.json\").read_text())\nassert payload[\"type\"] == \"handshake_accepted\", payload\nassert payload[\"protocol_version\"] == \"0.1.0\", payload\nPY\ncargo run --quiet -- peer-execute-quic --addr 127.0.0.1:9443 --server-name localhost --ca-cert \"$TMPDIR/cert.pem\" --prompt 'fozzy quic execute' >\"$TMPDIR/execute.json\"\nTMPDIR_PATH=\"$TMPDIR\" python3 - <<'PY'\nimport json, os, pathlib\npayload = json.loads(pathlib.Path(os.environ[\"TMPDIR_PATH\"], \"execute.json\").read_text())\nassert payload[\"type\"] == \"execute_job\", payload\nassert payload[\"record\"][\"status\"] in {\"completed\", \"recovered\"}, payload\nassert payload[\"record\"][\"result\"][\"backend\"] == \"mlx\", payload\nPY"
+      ],
+      "expect_exit": 0
+    }
+  ]
+}

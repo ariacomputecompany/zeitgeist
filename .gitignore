@@ -1,0 +1,6 @@
+/target
+/.venv
+/.fozzy/out
+/.fozzy/traces
+/.fozzy/corpus
+/tmp
