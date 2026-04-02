@@ -1,8 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use uuid::Uuid;
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -443,12 +443,56 @@ pub struct EventEnvelope {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CapabilitySnapshot {
     pub node: NodeIdentity,
     pub backends: Vec<BackendDescriptor>,
     pub models: Vec<ModelIdentity>,
     pub kernels: Vec<KernelDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MeshPeerSeed {
+    pub management_url: String,
+    pub peer_tcp_addr: String,
+    pub auth_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MeshConfig {
+    pub advertise_management_url: Option<String>,
+    pub advertise_peer_tcp_addr: Option<String>,
+    pub peers: Vec<MeshPeerSeed>,
+    pub sync_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MeshRegistrationRequest {
+    pub management_url: Option<String>,
+    pub peer_tcp_addr: String,
+    pub snapshot: CapabilitySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MeshPeerRecord {
+    pub node_id: String,
+    pub management_url: Option<String>,
+    pub peer_tcp_addr: String,
+    pub last_seen_unix_ms: u64,
+    pub snapshot: CapabilitySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MeshRegistrationResponse {
+    pub peer: MeshPeerRecord,
+    pub total_peers: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MeshSyncResponse {
+    pub configured_peers: usize,
+    pub discovered_peers: usize,
+    pub registered_peers: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -531,6 +575,9 @@ pub struct TopologyNode {
     pub transports: Vec<String>,
     pub backend_names: Vec<String>,
     pub model_ids: Vec<String>,
+    pub management_url: Option<String>,
+    pub peer_tcp_addr: Option<String>,
+    pub locality: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

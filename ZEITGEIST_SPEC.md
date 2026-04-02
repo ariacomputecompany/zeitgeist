@@ -136,9 +136,13 @@ Framing:
 - Live tensor/cache roundtrip verification
 - Live auth enforcement verification
 - Live SSE streaming verification
+- Live mesh peer registration and topology sync verification
+- Live mesh remote execution verification over peer transport
 - Live MLX adapter inference verification on Apple Silicon
 - Live remote vLLM inference verification through a Linux GPU pod and SSH tunnel
+- Live vLLM served-model alias resolution verification against upstream `/v1/models`
 - Linux-side Quilt container verification path
 - Verified Linux `cargo test` pass in Quilt
 - Verified Linux `vllm` install/import for x86_64 manylinux
 - Verified Linux `vllm` OpenAI entrypoint reaches device inference and currently stops without an active GPU/device
+- Verified real vLLM OpenAI inference on a Runpod RTX 4090 pod through the Rust runtime

@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "mesh-pass",
+  "steps": [
+    {
+      "type": "http_request",
+      "method": "POST",
+      "path": "http://127.0.0.1:18281/v1/mesh/sync",
+      "headers": {
+        "authorization": "Bearer mesh-token",
+        "x-zeitgeist-protocol-version": "0.1.0"
+      },
+      "expect_status": 200
+    },
+    {
+      "type": "http_request",
+      "method": "GET",
+      "path": "http://127.0.0.1:18281/v1/mesh/peers",
+      "expect_status": 200
+    },
+    {
+      "type": "http_request",
+      "method": "GET",
+      "path": "http://127.0.0.1:18281/v1/topology",
+      "expect_status": 200
+    },
+    {
+      "type": "http_request",
+      "method": "POST",
+      "path": "http://127.0.0.1:18281/v1/jobs",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer mesh-token",
+        "x-zeitgeist-protocol-version": "0.1.0"
+      },
+      "body": "{\"model_id\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"job_type\":\"chat_completion\",\"prompt\":\"Reply with the token MESHNET_LIVE\",\"session_id\":\"00000000-0000-0000-0000-000000000000\",\"preferred_backends\":[\"mesh-b/mlx\"],\"max_tokens\":16,\"temperature\":0.0,\"determinism\":{\"strict_correctness\":true,\"deterministic\":true,\"low_latency\":true,\"high_availability\":false}}",
+      "expect_status": 200
+    }
+  ]
+}

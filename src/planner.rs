@@ -5,7 +5,10 @@ pub fn compatibility(
     backends: &[BackendDescriptor],
     models: &[ModelIdentity],
 ) -> CompatibilityReport {
-    let Some(model) = models.iter().find(|model| model.model_id == request.model_id) else {
+    let Some(model) = models
+        .iter()
+        .find(|model| model.model_id == request.model_id)
+    else {
         return CompatibilityReport {
             outcome: CompatibilityOutcome::Incompatible,
             execution_mode: ExecutionMode::ClientOnly,
@@ -47,9 +50,12 @@ pub fn compatibility(
         };
     }
 
-    let exact_model = selected
-        .iter()
-        .all(|backend| backend.model_families.iter().any(|family| family == &model.family));
+    let exact_model = selected.iter().all(|backend| {
+        backend
+            .model_families
+            .iter()
+            .any(|family| family == &model.family)
+    });
     let exact_layout = selected.iter().all(|backend| {
         backend
             .tensor_layouts
@@ -69,13 +75,18 @@ pub fn compatibility(
         .map(|backend| backend.memory_budget_mb)
         .max()
         .unwrap_or_default();
-    let aggregate_memory_mb: u64 = selected.iter().map(|backend| backend.memory_budget_mb).sum();
+    let aggregate_memory_mb: u64 = selected
+        .iter()
+        .map(|backend| backend.memory_budget_mb)
+        .sum();
     let supports_tensor = selected
         .iter()
         .all(|backend| backend.parallelism.contains(&ExecutionMode::TensorParallel));
-    let supports_pipeline = selected
-        .iter()
-        .all(|backend| backend.parallelism.contains(&ExecutionMode::PipelineParallel));
+    let supports_pipeline = selected.iter().all(|backend| {
+        backend
+            .parallelism
+            .contains(&ExecutionMode::PipelineParallel)
+    });
     let supports_expert = model.expert_count.is_some()
         && selected
             .iter()
@@ -153,7 +164,12 @@ pub fn plan(
         compatibility
             .selected_peers
             .iter()
-            .filter_map(|name| backends.iter().find(|backend| &backend.name == name).cloned())
+            .filter_map(|name| {
+                backends
+                    .iter()
+                    .find(|backend| &backend.name == name)
+                    .cloned()
+            })
             .collect(),
     );
     let participants: Vec<_> = ordered
@@ -176,7 +192,10 @@ pub fn plan(
         session_id,
         mode: compatibility.execution_mode.clone(),
         compatibility,
-        estimated_cost: participants.iter().map(|participant| participant.cost).sum(),
+        estimated_cost: participants
+            .iter()
+            .map(|participant| participant.cost)
+            .sum(),
         participants,
         tensor_layout: model.tensor_layout.clone(),
         cache,
@@ -196,7 +215,9 @@ fn trusted_backends(
     for backend in candidates {
         let trusted = matches!(
             backend.trust_level,
-            TrustLevel::TrustedExecutor | TrustLevel::TrustedCachePeer | TrustLevel::TrustedTensorPeer
+            TrustLevel::TrustedExecutor
+                | TrustLevel::TrustedCachePeer
+                | TrustLevel::TrustedTensorPeer
         );
         if !trusted {
             reasons.push(format!(
@@ -254,7 +275,11 @@ fn choose_execution_mode(
         return ExecutionMode::Solo;
     }
     let single_backend_pressure = estimated_memory_mb > max_backend_memory_mb;
-    if supports_tensor && supports_expert && single_backend_pressure && estimated_memory_mb <= aggregate_memory_mb {
+    if supports_tensor
+        && supports_expert
+        && single_backend_pressure
+        && estimated_memory_mb <= aggregate_memory_mb
+    {
         return ExecutionMode::Hybrid;
     }
     if supports_expert {
@@ -275,7 +300,9 @@ fn backend_cost(backend: &BackendDescriptor) -> u64 {
         "regional" => 15,
         _ => 40,
     };
-    locality_cost + backend.topology.base_latency_ms as u64 + (backend.topology.hop_count as u64 * 10)
+    locality_cost
+        + backend.topology.base_latency_ms as u64
+        + (backend.topology.hop_count as u64 * 10)
 }
 
 fn model_memory_mb(model: &ModelIdentity) -> u64 {
@@ -291,7 +318,12 @@ fn model_memory_mb(model: &ModelIdentity) -> u64 {
 mod tests {
     use super::*;
 
-    fn backend(name: &str, locality: &str, latency_ms: u32, memory_budget_mb: u64) -> BackendDescriptor {
+    fn backend(
+        name: &str,
+        locality: &str,
+        latency_ms: u32,
+        memory_budget_mb: u64,
+    ) -> BackendDescriptor {
         BackendDescriptor {
             name: name.into(),
             version: "test".into(),
@@ -384,7 +416,10 @@ mod tests {
                     high_availability: false,
                 },
             },
-            &[backend("mlx", "local", 2, 2048), backend("vllm", "remote", 8, 4096)],
+            &[
+                backend("mlx", "local", 2, 2048),
+                backend("vllm", "remote", 8, 4096),
+            ],
             &[model()],
         );
         assert_eq!(report.outcome, CompatibilityOutcome::FullyCompatible);
@@ -412,7 +447,12 @@ mod tests {
             &[model()],
         );
         assert_eq!(report.selected_peers, vec!["good"]);
-        assert!(report.reasons.iter().any(|reason| reason.contains("excluded")));
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("excluded"))
+        );
     }
 
     #[test]
@@ -438,10 +478,12 @@ mod tests {
             &[model()],
         );
         assert_eq!(report.selected_peers, vec!["good"]);
-        assert!(report
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("signed attestation")));
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("signed attestation"))
+        );
     }
 
     #[test]
@@ -462,7 +504,10 @@ mod tests {
                     high_availability: true,
                 },
             },
-            &[backend("remote", "remote", 40, 4096), backend("local", "local", 2, 4096)],
+            &[
+                backend("remote", "remote", 40, 4096),
+                backend("local", "local", 2, 4096),
+            ],
             &[model()],
         );
         assert_eq!(plan.participants[0].backend, "local");

@@ -1,6 +1,6 @@
 # Zeitgeist
 
-Zeitgeist is a runtime for a backend-neutral distributed inference protocol.
+Zeitgeist is a backend-neutral distributed inference runtime.
 
 It includes typed protocol objects, compatibility and planning logic, backend adapters, HTTP APIs, peer transports, and deterministic certification paths for validating the runtime alongside live model execution.
 
@@ -24,6 +24,9 @@ It includes typed protocol objects, compatibility and planning logic, backend ad
 cargo run -- serve --bind 127.0.0.1:8080
 cargo run -- describe --pretty
 cargo run -- smoke --prompt "hello mesh"
+cargo run -- smoke --model-id Qwen/Qwen2.5-0.5B-Instruct --backend vllm --prompt "hello mesh"
+cargo run -- mesh-sync
+cargo run -- mesh-peers
 ```
 
 Peer commands:
@@ -50,6 +53,7 @@ cargo run -- peer-execute --addr 127.0.0.1:9090 --prompt "remote execute"
 - `GET /v1/transport-health`
 - `GET /v1/planner-decisions`
 - `GET /v1/topology`
+- `GET /v1/mesh/peers`
 - `GET /v1/schema`
 - `GET /v1/jobs`
 - `GET /v1/jobs/{job_id}`
@@ -60,6 +64,8 @@ cargo run -- peer-execute --addr 127.0.0.1:9090 --prompt "remote execute"
 - `POST /v1/jobs`
 - `POST /v1/jobs/stream`
 - `POST /v1/jobs/{job_id}/cancel`
+- `POST /v1/mesh/register`
+- `POST /v1/mesh/sync`
 - `POST /v1/tensors/roundtrip`
 - `POST /v1/cache/roundtrip`
 
@@ -77,6 +83,8 @@ If no config file is supplied, the runtime also defaults to live backends and re
 Synthetic execution remains available only through explicit `kind = "synthetic"` backend entries in the runtime config.
 
 The checked-in `vllm` backend assumes a live upstream server is reachable at `http://127.0.0.1:8000`.
+The adapter resolves upstream served-model aliases from `/v1/models`, so a logical protocol `model_id` can be routed to the live vLLM-served model identifier without hardcoded string coupling.
+Mesh deployment uses `[mesh]` plus `[[mesh.peers]]` entries with a management URL and TCP peer address for each node. On a Tailscale or other LAN-style overlay, set both to the node's tailnet address.
 
 Protocol matching is strict:
 
@@ -106,4 +114,16 @@ fozzy run tests/quic_mtls.pass.fozzy.json --det --record .fozzy/traces/quic-mtls
 fozzy trace verify .fozzy/traces/quic-mtls.fozzy --strict --json
 fozzy replay .fozzy/traces/quic-mtls.fozzy --json
 fozzy ci .fozzy/traces/quic-mtls.fozzy --json
+fozzy doctor --deep --scenario tests/mesh.pass.fozzy.json --runs 5 --seed 4242 --proc-backend host --http-backend host --json
+fozzy test --det --strict tests/mesh.pass.fozzy.json --proc-backend host --http-backend host --json
+fozzy run tests/mesh.pass.fozzy.json --det --record .fozzy/traces/mesh-live.trace.fozzy --proc-backend host --http-backend host --json
+fozzy trace verify .fozzy/traces/mesh-live.trace.fozzy --strict --json
+fozzy replay .fozzy/traces/mesh-live.trace.fozzy --json
+fozzy ci .fozzy/traces/mesh-live.trace.fozzy --json
+fozzy doctor --deep --scenario tests/vllm.live.pass.fozzy.json --runs 5 --seed 4242 --json
+fozzy test --det --strict tests/vllm.live.pass.fozzy.json --proc-backend host --http-backend host --json
+fozzy run tests/vllm.live.pass.fozzy.json --det --record .fozzy/traces/vllm-live.trace.fozzy --proc-backend host --http-backend host --json
+fozzy trace verify .fozzy/traces/vllm-live.trace.fozzy --strict --json
+fozzy replay .fozzy/traces/vllm-live.trace.fozzy --json
+fozzy ci .fozzy/traces/vllm-live.trace.fozzy --json
 ```

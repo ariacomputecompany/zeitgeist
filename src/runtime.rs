@@ -1,14 +1,18 @@
 use crate::{
-    backend::SharedBackend,
+    backend::{RemotePeerBackend, SharedBackend},
     planner,
     types::*,
 };
-use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use anyhow::{Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, RwLock as StdRwLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -21,9 +25,13 @@ pub struct Runtime {
 
 struct Inner {
     node: NodeIdentity,
-    backends: Vec<SharedBackend>,
-    models: Vec<ModelIdentity>,
+    local_backends: Vec<SharedBackend>,
+    local_models: Vec<ModelIdentity>,
     kernels: Vec<KernelDescriptor>,
+    remote_backends: StdRwLock<Vec<SharedBackend>>,
+    remote_models: StdRwLock<Vec<ModelIdentity>>,
+    mesh_peers: StdRwLock<BTreeMap<String, MeshPeerRecord>>,
+    mesh_config: Option<MeshConfig>,
     jobs: RwLock<BTreeMap<Uuid, JobRecord>>,
     event_log: RwLock<Vec<EventEnvelope>>,
     planner_decisions: RwLock<Vec<PlannerDecisionRecord>>,
@@ -46,14 +54,19 @@ impl Runtime {
         models: Vec<ModelIdentity>,
         kernels: Vec<KernelDescriptor>,
         auth_token: Option<String>,
+        mesh_config: Option<MeshConfig>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(Inner {
                 node,
-                backends,
-                models,
+                local_backends: backends,
+                local_models: models,
                 kernels,
+                remote_backends: StdRwLock::new(Vec::new()),
+                remote_models: StdRwLock::new(Vec::new()),
+                mesh_peers: StdRwLock::new(BTreeMap::new()),
+                mesh_config,
                 jobs: RwLock::new(BTreeMap::new()),
                 event_log: RwLock::new(Vec::new()),
                 planner_decisions: RwLock::new(Vec::new()),
@@ -67,10 +80,46 @@ impl Runtime {
     pub fn capabilities(&self) -> CapabilitySnapshot {
         CapabilitySnapshot {
             node: self.inner.node.clone(),
-            backends: self.inner.backends.iter().map(|backend| backend.descriptor()).collect(),
-            models: self.inner.models.clone(),
+            backends: self
+                .inner
+                .local_backends
+                .iter()
+                .map(|backend| backend.descriptor())
+                .collect(),
+            models: self.inner.local_models.clone(),
             kernels: self.inner.kernels.clone(),
         }
+    }
+
+    pub fn mesh_config(&self) -> Option<MeshConfig> {
+        self.inner.mesh_config.clone()
+    }
+
+    pub fn all_backend_descriptors(&self) -> Vec<BackendDescriptor> {
+        self.inner
+            .local_backends
+            .iter()
+            .map(|backend| backend.descriptor())
+            .chain(
+                self.inner
+                    .remote_backends
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|backend| backend.descriptor()),
+            )
+            .collect()
+    }
+
+    pub fn all_models(&self) -> Vec<ModelIdentity> {
+        let mut seen = BTreeSet::new();
+        self.inner
+            .local_models
+            .iter()
+            .cloned()
+            .chain(self.inner.remote_models.read().unwrap().iter().cloned())
+            .filter(|model| seen.insert(model.model_id.clone()))
+            .collect()
     }
 
     pub fn protocol_version(&self) -> &str {
@@ -80,7 +129,6 @@ impl Runtime {
     pub fn auth_token(&self) -> Option<&str> {
         self.inner.auth_token.as_deref()
     }
-
 
     pub fn signed_identity_for(&self, node_id: &str) -> SignedIdentity {
         let signing_key = self.signing_key();
@@ -100,9 +148,13 @@ impl Runtime {
         protocol_version: &str,
         signed_identity: Option<&SignedIdentity>,
     ) -> Result<()> {
-        let signed_identity = signed_identity.ok_or_else(|| anyhow!("missing signed node identity"))?;
+        let signed_identity =
+            signed_identity.ok_or_else(|| anyhow!("missing signed node identity"))?;
         if signed_identity.algorithm != "ed25519" {
-            return Err(anyhow!("unsupported signed identity algorithm {}", signed_identity.algorithm));
+            return Err(anyhow!(
+                "unsupported signed identity algorithm {}",
+                signed_identity.algorithm
+            ));
         }
         let public_key_bytes = BASE64
             .decode(&signed_identity.public_key)
@@ -142,32 +194,43 @@ impl Runtime {
     }
 
     pub fn compatibility(&self, request: &CompatibilityRequest) -> CompatibilityReport {
-        let report = planner::compatibility(
-            request,
-            &self.inner.backends.iter().map(|backend| backend.descriptor()).collect::<Vec<_>>(),
-            &self.inner.models,
+        let report =
+            planner::compatibility(request, &self.all_backend_descriptors(), &self.all_models());
+        self.record_planner_decision(
+            PlannerDecisionKind::Compatibility,
+            &request.model_id,
+            &report,
         );
-        self.record_planner_decision(PlannerDecisionKind::Compatibility, &request.model_id, &report);
         report
     }
 
     pub fn plan(&self, request: &JobRequest) -> Result<JobPlan> {
-        if !self.inner.models.iter().any(|model| model.model_id == request.model_id) {
+        if !self
+            .all_models()
+            .iter()
+            .any(|model| model.model_id == request.model_id)
+        {
             return Err(anyhow!("unknown model_id {}", request.model_id));
         }
-        let plan = planner::plan(
-            request,
-            &self.inner.backends.iter().map(|backend| backend.descriptor()).collect::<Vec<_>>(),
-            &self.inner.models,
+        let plan = planner::plan(request, &self.all_backend_descriptors(), &self.all_models());
+        self.record_planner_decision(
+            PlannerDecisionKind::Plan,
+            &request.model_id,
+            &plan.compatibility,
         );
-        self.record_planner_decision(PlannerDecisionKind::Plan, &request.model_id, &plan.compatibility);
         Ok(plan)
     }
 
     pub async fn submit_job(&self, request: JobRequest) -> Result<JobRecord> {
         let plan = self.plan(&request)?;
-        if matches!(plan.compatibility.outcome, CompatibilityOutcome::Incompatible) {
-            return Err(anyhow!("request is incompatible: {}", plan.compatibility.reasons.join("; ")));
+        if matches!(
+            plan.compatibility.outcome,
+            CompatibilityOutcome::Incompatible
+        ) {
+            return Err(anyhow!(
+                "request is incompatible: {}",
+                plan.compatibility.reasons.join("; ")
+            ));
         }
         let job_id = Uuid::new_v4();
         let mut record = JobRecord {
@@ -186,7 +249,10 @@ impl Runtime {
         self.store(record.clone()).await;
         self.emit("job".into(), format!("job {} executing", job_id));
 
-        match self.execute_with_recovery(&request, &record.plan, job_id).await {
+        match self
+            .execute_with_recovery(&request, &record.plan, job_id)
+            .await
+        {
             Ok(outcome) => {
                 record.status = if outcome.recovered {
                     JobStatus::Recovered
@@ -201,7 +267,11 @@ impl Runtime {
                     format!(
                         "job {} {}",
                         job_id,
-                        if matches!(record.status, JobStatus::Recovered) { "recovered" } else { "completed" }
+                        if matches!(record.status, JobStatus::Recovered) {
+                            "recovered"
+                        } else {
+                            "completed"
+                        }
                     ),
                 );
             }
@@ -227,18 +297,20 @@ impl Runtime {
     pub async fn sessions(&self) -> Vec<SessionSummary> {
         let mut sessions = BTreeMap::<Uuid, SessionSummary>::new();
         for job in self.inner.jobs.read().await.values() {
-            let entry = sessions.entry(job.session_id).or_insert_with(|| SessionSummary {
-                session_id: job.session_id,
-                model_id: job
-                    .plan
-                    .participants
-                    .first()
-                    .map(|participant| participant.model_id.clone())
-                    .unwrap_or_else(|| "unknown".into()),
-                execution_mode: job.plan.mode.clone(),
-                status: job.status.clone(),
-                job_ids: Vec::new(),
-            });
+            let entry = sessions
+                .entry(job.session_id)
+                .or_insert_with(|| SessionSummary {
+                    session_id: job.session_id,
+                    model_id: job
+                        .plan
+                        .participants
+                        .first()
+                        .map(|participant| participant.model_id.clone())
+                        .unwrap_or_else(|| "unknown".into()),
+                    execution_mode: job.plan.mode.clone(),
+                    status: job.status.clone(),
+                    job_ids: Vec::new(),
+                });
             entry.status = job.status.clone();
             entry.job_ids.push(job.job_id);
         }
@@ -281,7 +353,8 @@ impl Runtime {
                 name: "quic_peer".into(),
                 status: TransportStatus::Healthy,
                 latency_class: "low".into(),
-                notes: "peer negotiation, planning, and remote execution supported over QUIC".into(),
+                notes: "peer negotiation, planning, and remote execution supported over QUIC"
+                    .into(),
             },
             TransportHealth {
                 name: "unix_peer".into(),
@@ -289,14 +362,201 @@ impl Runtime {
                 latency_class: "ultra_low".into(),
                 notes: "unix domain socket peer transport supported".into(),
             },
+            TransportHealth {
+                name: "mesh_management".into(),
+                status: if self.inner.mesh_config.is_some() {
+                    TransportStatus::Healthy
+                } else {
+                    TransportStatus::Unsupported
+                },
+                latency_class: "low".into(),
+                notes: "mesh peer registration and capability sync over management HTTP".into(),
+            },
         ]
+    }
+
+    pub fn mesh_peers(&self) -> Vec<MeshPeerRecord> {
+        self.inner
+            .mesh_peers
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn register_mesh_peer(
+        &self,
+        request: MeshRegistrationRequest,
+    ) -> Result<MeshRegistrationResponse> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let peer = MeshPeerRecord {
+            node_id: request.snapshot.node.node_id.clone(),
+            management_url: request.management_url,
+            peer_tcp_addr: request.peer_tcp_addr,
+            last_seen_unix_ms: now,
+            snapshot: request.snapshot,
+        };
+        self.upsert_mesh_peer(peer.clone())?;
+        Ok(MeshRegistrationResponse {
+            peer,
+            total_peers: self.inner.mesh_peers.read().unwrap().len(),
+        })
+    }
+
+    pub async fn sync_mesh_once(&self) -> Result<MeshSyncResponse> {
+        let Some(mesh) = self.mesh_config() else {
+            return Ok(MeshSyncResponse {
+                configured_peers: 0,
+                discovered_peers: 0,
+                registered_peers: self.inner.mesh_peers.read().unwrap().len(),
+            });
+        };
+        let client = reqwest::Client::new();
+        let local_snapshot = self.capabilities();
+        let mut discovered = 0usize;
+
+        for seed in &mesh.peers {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(token) = &seed.auth_token {
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?,
+                );
+            }
+            headers.insert(
+                "x-zeitgeist-protocol-version",
+                reqwest::header::HeaderValue::from_str(self.protocol_version())?,
+            );
+
+            let base = seed.management_url.trim_end_matches('/');
+            let node: NodeIdentity = client
+                .get(format!("{base}/v1/node"))
+                .headers(headers.clone())
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let backends: Vec<BackendDescriptor> = client
+                .get(format!("{base}/v1/backends"))
+                .headers(headers.clone())
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let models: Vec<ModelIdentity> = client
+                .get(format!("{base}/v1/models"))
+                .headers(headers.clone())
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let kernels: Vec<KernelDescriptor> = client
+                .get(format!("{base}/v1/kernels"))
+                .headers(headers.clone())
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            self.upsert_mesh_peer(MeshPeerRecord {
+                node_id: node.node_id.clone(),
+                management_url: Some(seed.management_url.clone()),
+                peer_tcp_addr: seed.peer_tcp_addr.clone(),
+                last_seen_unix_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                snapshot: CapabilitySnapshot {
+                    node,
+                    backends,
+                    models,
+                    kernels,
+                },
+            })?;
+            discovered += 1;
+
+            if let (Some(advertise_management_url), Some(advertise_peer_tcp_addr)) = (
+                mesh.advertise_management_url.as_ref(),
+                mesh.advertise_peer_tcp_addr.as_ref(),
+            ) {
+                let registration = MeshRegistrationRequest {
+                    management_url: Some(advertise_management_url.clone()),
+                    peer_tcp_addr: advertise_peer_tcp_addr.clone(),
+                    snapshot: local_snapshot.clone(),
+                };
+                let _ = client
+                    .post(format!("{base}/v1/mesh/register"))
+                    .headers(headers.clone())
+                    .json(&registration)
+                    .send()
+                    .await?;
+            }
+        }
+
+        Ok(MeshSyncResponse {
+            configured_peers: mesh.peers.len(),
+            discovered_peers: discovered,
+            registered_peers: self.inner.mesh_peers.read().unwrap().len(),
+        })
+    }
+
+    fn upsert_mesh_peer(&self, peer: MeshPeerRecord) -> Result<()> {
+        if peer.snapshot.node.protocol_version != self.protocol_version() {
+            return Err(anyhow!(
+                "mesh peer {} protocol mismatch {} != {}",
+                peer.node_id,
+                peer.snapshot.node.protocol_version,
+                self.protocol_version()
+            ));
+        }
+        self.inner
+            .mesh_peers
+            .write()
+            .unwrap()
+            .insert(peer.node_id.clone(), peer);
+
+        let peers = self.mesh_peers();
+        let mut remote_backend_acc = Vec::new();
+        let mut remote_model_acc = Vec::new();
+        for peer in &peers {
+            remote_model_acc.extend(peer.snapshot.models.clone());
+            remote_backend_acc.extend(peer.snapshot.backends.iter().cloned().map(|descriptor| {
+                Arc::new(RemotePeerBackend::new(
+                    peer.node_id.clone(),
+                    peer.peer_tcp_addr.clone(),
+                    peer.management_url.clone(),
+                    self.auth_token().map(ToString::to_string),
+                    self.protocol_version().to_string(),
+                    descriptor,
+                )) as SharedBackend
+            }));
+        }
+        *self.inner.remote_backends.write().unwrap() = remote_backend_acc;
+        *self.inner.remote_models.write().unwrap() = remote_model_acc;
+        Ok(())
     }
 
     pub async fn topology(&self) -> TopologyView {
         let jobs = self.inner.jobs.read().await;
         let active_jobs = jobs
             .values()
-            .filter(|job| matches!(job.status, JobStatus::Executing | JobStatus::Streaming | JobStatus::Recovered | JobStatus::Completed))
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    JobStatus::Executing
+                        | JobStatus::Streaming
+                        | JobStatus::Recovered
+                        | JobStatus::Completed
+                )
+            })
             .count();
         let active_sessions = jobs
             .values()
@@ -306,18 +566,57 @@ impl Runtime {
         TopologyView {
             protocol_version: self.protocol_version().to_string(),
             compatibility_mode: VERSION_POLICY.into(),
-            nodes: vec![TopologyNode {
+            nodes: std::iter::once(TopologyNode {
                 node_id: self.inner.node.node_id.clone(),
                 health: self.inner.node.health.clone(),
                 transports: self.inner.node.transports.clone(),
                 backend_names: self
                     .inner
-                    .backends
+                    .local_backends
                     .iter()
                     .map(|backend| backend.name().to_string())
                     .collect(),
-                model_ids: self.inner.models.iter().map(|model| model.model_id.clone()).collect(),
-            }],
+                model_ids: self
+                    .inner
+                    .local_models
+                    .iter()
+                    .map(|model| model.model_id.clone())
+                    .collect(),
+                management_url: self
+                    .inner
+                    .mesh_config
+                    .as_ref()
+                    .and_then(|mesh| mesh.advertise_management_url.clone()),
+                peer_tcp_addr: self
+                    .inner
+                    .mesh_config
+                    .as_ref()
+                    .and_then(|mesh| mesh.advertise_peer_tcp_addr.clone()),
+                locality: "local".into(),
+            })
+            .chain(self.mesh_peers().into_iter().map(|peer| {
+                TopologyNode {
+                    node_id: peer.node_id,
+                    health: peer.snapshot.node.health,
+                    transports: peer.snapshot.node.transports,
+                    backend_names: peer
+                        .snapshot
+                        .backends
+                        .into_iter()
+                        .map(|backend| backend.name)
+                        .collect(),
+                    model_ids: peer
+                        .snapshot
+                        .models
+                        .into_iter()
+                        .map(|model| model.model_id)
+                        .collect(),
+                    management_url: peer.management_url,
+                    peer_tcp_addr: Some(peer.peer_tcp_addr),
+                    locality: "mesh_remote".into(),
+                }
+            }))
+            .collect(),
             active_sessions,
             active_jobs,
         }
@@ -325,7 +624,9 @@ impl Runtime {
 
     pub async fn cancel_job(&self, job_id: Uuid) -> Result<JobCancellation> {
         let mut jobs = self.inner.jobs.write().await;
-        let record = jobs.get_mut(&job_id).ok_or_else(|| anyhow!("job not found"))?;
+        let record = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| anyhow!("job not found"))?;
         record.status = JobStatus::Cancelled;
         record.error = Some("cancelled by operator".into());
         self.inner
@@ -345,8 +646,14 @@ impl Runtime {
         request: JobRequest,
     ) -> Result<(JobRecord, ReceiverStream<Result<JobStreamChunk>>)> {
         let plan = self.plan(&request)?;
-        if matches!(plan.compatibility.outcome, CompatibilityOutcome::Incompatible) {
-            return Err(anyhow!("request is incompatible: {}", plan.compatibility.reasons.join("; ")));
+        if matches!(
+            plan.compatibility.outcome,
+            CompatibilityOutcome::Incompatible
+        ) {
+            return Err(anyhow!(
+                "request is incompatible: {}",
+                plan.compatibility.reasons.join("; ")
+            ));
         }
         let job_id = Uuid::new_v4();
         let mut record = JobRecord {
@@ -366,7 +673,10 @@ impl Runtime {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
-            match runtime.execute_with_recovery(&request_clone, &plan, job_id).await {
+            match runtime
+                .execute_with_recovery(&request_clone, &plan, job_id)
+                .await
+            {
                 Ok(outcome) => {
                     let result = outcome.result;
                     for (index, token) in result.text.split_whitespace().enumerate() {
@@ -461,14 +771,20 @@ impl Runtime {
             }
 
             match self
-                .execute_plan_attempt(request, &current_plan, job_id, &mut attempts, current_plan.replan_generation > 0)
+                .execute_plan_attempt(
+                    request,
+                    &current_plan,
+                    job_id,
+                    &mut attempts,
+                    current_plan.replan_generation > 0,
+                )
                 .await
             {
                 Ok(result) => {
                     let recovered_now = recovered
-                        || attempts
-                            .iter()
-                            .any(|attempt| attempt.status == AttemptStatus::Failed || attempt.same_peer_retry);
+                        || attempts.iter().any(|attempt| {
+                            attempt.status == AttemptStatus::Failed || attempt.same_peer_retry
+                        });
                     return Ok(ExecutionOutcome {
                         result,
                         recovered: recovered_now,
@@ -480,14 +796,16 @@ impl Runtime {
                     last_error = Some(error);
                     recovered = true;
                     for participant in &current_plan.participants {
-                        if attempts
-                            .iter()
-                            .any(|attempt| attempt.backend == participant.backend && attempt.status == AttemptStatus::Failed)
-                        {
+                        if attempts.iter().any(|attempt| {
+                            attempt.backend == participant.backend
+                                && attempt.status == AttemptStatus::Failed
+                        }) {
                             failed_backends.insert(participant.backend.clone());
                         }
                     }
-                    let Some(next_plan) = self.replan_excluding(request, &current_plan, &failed_backends) else {
+                    let Some(next_plan) =
+                        self.replan_excluding(request, &current_plan, &failed_backends)
+                    else {
                         break;
                     };
                     self.emit(
@@ -508,11 +826,10 @@ impl Runtime {
     fn execution_candidates(&self, request: &JobRequest, plan: &JobPlan) -> Vec<SharedBackend> {
         let mut ordered = Vec::<SharedBackend>::new();
         let mut seen = std::collections::BTreeSet::<String>::new();
+        let all_backends = self.available_backends();
 
         for participant in &plan.participants {
-            if let Some(backend) = self
-                .inner
-                .backends
+            if let Some(backend) = all_backends
                 .iter()
                 .find(|backend| backend.name() == participant.backend)
             {
@@ -522,15 +839,19 @@ impl Runtime {
             }
         }
 
-        if plan.fallback_modes.contains(&ExecutionMode::Solo) || plan.fallback_modes.contains(&ExecutionMode::RoutedServing) {
-            for backend in &self.inner.backends {
+        if plan.fallback_modes.contains(&ExecutionMode::Solo)
+            || plan.fallback_modes.contains(&ExecutionMode::RoutedServing)
+        {
+            for backend in &all_backends {
                 let descriptor = backend.descriptor();
-                let supports_model = descriptor
-                    .model_families
-                    .iter()
-                    .any(|family| self.model_family(&request.model_id).is_some_and(|candidate| family == candidate));
+                let supports_model = descriptor.model_families.iter().any(|family| {
+                    self.model_family(&request.model_id)
+                        .is_some_and(|candidate| family == &candidate)
+                });
                 let supports_fallback = descriptor.execution_modes.contains(&ExecutionMode::Solo)
-                    || descriptor.execution_modes.contains(&ExecutionMode::RoutedServing);
+                    || descriptor
+                        .execution_modes
+                        .contains(&ExecutionMode::RoutedServing);
                 if supports_model && supports_fallback && seen.insert(backend.name().to_string()) {
                     ordered.push(backend.clone());
                 }
@@ -553,9 +874,13 @@ impl Runtime {
             | ExecutionMode::PipelineParallel
             | ExecutionMode::ExpertParallel
             | ExecutionMode::Hybrid => {
-                self.execute_distributed_attempt(request, plan, job_id, attempts, replanned).await
+                self.execute_distributed_attempt(request, plan, job_id, attempts, replanned)
+                    .await
             }
-            _ => self.execute_serial_attempt(request, plan, job_id, attempts, replanned).await,
+            _ => {
+                self.execute_serial_attempt(request, plan, job_id, attempts, replanned)
+                    .await
+            }
         }
     }
 
@@ -617,7 +942,10 @@ impl Runtime {
                                 }
                                 self.emit(
                                     "recovery".into(),
-                                    format!("job {} backend {} recovered on same-peer retry", job_id, backend_name),
+                                    format!(
+                                        "job {} backend {} recovered on same-peer retry",
+                                        job_id, backend_name
+                                    ),
                                 );
                                 return Ok(result);
                             }
@@ -653,12 +981,11 @@ impl Runtime {
         let mut max_tokens = 0_u32;
         let mut embeddings = None;
         let mut saw_failure = false;
-        let mut last_error = None;
+        let mut last_error: Option<anyhow::Error> = None;
 
         for participant in &plan.participants {
-            let Some(backend) = self
-                .inner
-                .backends
+            let available_backends = self.available_backends();
+            let Some(backend) = available_backends
                 .iter()
                 .find(|backend| backend.name() == participant.backend)
                 .cloned()
@@ -731,11 +1058,15 @@ impl Runtime {
         })
     }
 
-    fn should_retry_same_peer(&self, request: &JobRequest, backend_name: &str, error: &anyhow::Error) -> bool {
+    fn should_retry_same_peer(
+        &self,
+        request: &JobRequest,
+        backend_name: &str,
+        error: &anyhow::Error,
+    ) -> bool {
         request.determinism.high_availability
             && self
-                .inner
-                .backends
+                .available_backends()
                 .iter()
                 .find(|backend| backend.name() == backend_name)
                 .map(|backend| {
@@ -760,8 +1091,7 @@ impl Runtime {
             .iter()
             .map(|participant| participant.backend.clone())
             .chain(
-                self.inner
-                    .backends
+                self.available_backends()
                     .iter()
                     .map(|backend| backend.name().to_string()),
             )
@@ -783,19 +1113,29 @@ impl Runtime {
             determinism: request.determinism.clone(),
         };
         let mut next_plan = self.plan(&replanned_request).ok()?;
-        if next_plan.participants == current_plan.participants && next_plan.mode == current_plan.mode {
+        if next_plan.participants == current_plan.participants
+            && next_plan.mode == current_plan.mode
+        {
             return None;
         }
         next_plan.replan_generation = current_plan.replan_generation + 1;
         Some(next_plan)
     }
 
-    fn model_family(&self, model_id: &str) -> Option<&str> {
-        self.inner
-            .models
-            .iter()
+    fn model_family(&self, model_id: &str) -> Option<String> {
+        self.all_models()
+            .into_iter()
             .find(|model| model.model_id == model_id)
-            .map(|model| model.family.as_str())
+            .map(|model| model.family)
+    }
+
+    fn available_backends(&self) -> Vec<SharedBackend> {
+        self.inner
+            .local_backends
+            .iter()
+            .cloned()
+            .chain(self.inner.remote_backends.read().unwrap().iter().cloned())
+            .collect()
     }
 
     async fn store(&self, record: JobRecord) {
@@ -850,8 +1190,9 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::{
-        backend::{synthetic_backends, SyntheticBackend},
-        config,
+        api,
+        backend::{SyntheticBackend, synthetic_backends},
+        config, peer,
     };
     use std::{collections::BTreeMap, sync::Arc};
 
@@ -899,6 +1240,7 @@ mod tests {
             config::models(),
             config::kernels(),
             None,
+            None,
         );
         let record = runtime
             .submit_job(JobRequest {
@@ -938,6 +1280,7 @@ mod tests {
             ],
             config::models(),
             config::kernels(),
+            None,
             None,
         );
 
@@ -982,6 +1325,7 @@ mod tests {
             config::models(),
             config::kernels(),
             None,
+            None,
         );
 
         let record = runtime
@@ -1018,6 +1362,7 @@ mod tests {
             vec![Arc::new(SyntheticBackend::new(transient))],
             config::models(),
             config::kernels(),
+            None,
             None,
         );
 
@@ -1064,6 +1409,7 @@ mod tests {
             vec![custom_model(20_000_000_000, None)],
             config::kernels(),
             None,
+            None,
         );
 
         let record = runtime
@@ -1108,6 +1454,7 @@ mod tests {
             ],
             vec![custom_model(20_000_000_000, Some(8))],
             config::kernels(),
+            None,
             None,
         );
 
@@ -1154,6 +1501,7 @@ mod tests {
             vec![custom_model(20_000_000_000, None)],
             config::kernels(),
             None,
+            None,
         );
 
         let record = runtime
@@ -1178,6 +1526,91 @@ mod tests {
         assert_eq!(record.status, JobStatus::Recovered);
         assert!(record.plan.replan_generation > 0);
         assert!(record.attempts.iter().any(|attempt| attempt.replanned));
-        assert!(record.attempts.iter().any(|attempt| attempt.status == AttemptStatus::Failed));
+        assert!(
+            record
+                .attempts
+                .iter()
+                .any(|attempt| attempt.status == AttemptStatus::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_sync_registers_remote_peer_and_executes_over_peer_transport() {
+        let mut remote_identity = config::node_identity(&Default::default());
+        remote_identity.node_id = "mesh-remote".into();
+        let remote_runtime = Runtime::new(
+            remote_identity,
+            synthetic_backends(),
+            config::models(),
+            config::kernels(),
+            Some("mesh-token".into()),
+            None,
+        );
+
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+        drop(peer_listener);
+        let remote_peer_runtime = remote_runtime.clone();
+        tokio::spawn(async move {
+            peer::serve(remote_peer_runtime, &peer_addr.to_string())
+                .await
+                .unwrap();
+        });
+
+        let management_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let management_addr = management_listener.local_addr().unwrap();
+        let remote_api_runtime = remote_runtime.clone();
+        tokio::spawn(async move {
+            axum::serve(management_listener, api::router(remote_api_runtime))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let local_runtime = Runtime::new(
+            config::node_identity(&Default::default()),
+            synthetic_backends(),
+            config::models(),
+            config::kernels(),
+            Some("mesh-token".into()),
+            Some(MeshConfig {
+                advertise_management_url: None,
+                advertise_peer_tcp_addr: None,
+                peers: vec![MeshPeerSeed {
+                    management_url: format!("http://{}", management_addr),
+                    peer_tcp_addr: peer_addr.to_string(),
+                    auth_token: Some("mesh-token".into()),
+                }],
+                sync_interval_ms: 30_000,
+            }),
+        );
+
+        let sync = local_runtime.sync_mesh_once().await.unwrap();
+        assert_eq!(sync.discovered_peers, 1);
+        assert_eq!(local_runtime.mesh_peers().len(), 1);
+        assert_eq!(local_runtime.topology().await.nodes.len(), 2);
+
+        let record = local_runtime
+            .submit_job(JobRequest {
+                model_id: "llama-3.2-3b-instruct".into(),
+                job_type: JobType::ChatCompletion,
+                prompt: "mesh execute".into(),
+                session_id: None,
+                preferred_backends: vec!["mesh-remote/mlx".into()],
+                max_tokens: 16,
+                temperature: 0.0,
+                determinism: DeterminismPolicy {
+                    strict_correctness: true,
+                    deterministic: true,
+                    low_latency: true,
+                    high_availability: false,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(record.status, JobStatus::Completed);
+        assert_eq!(record.attempts[0].backend, "mesh-remote/mlx");
+        assert_eq!(record.result.unwrap().backend, "mlx");
     }
 }

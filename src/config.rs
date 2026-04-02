@@ -1,11 +1,11 @@
 use crate::{
-    backend::{default_backends, MlxBackend, SharedBackend, SyntheticBackend, VllmBackend},
+    backend::{MlxBackend, SharedBackend, SyntheticBackend, VllmBackend, default_backends},
     types::*,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::Path};
 use std::sync::Arc;
+use std::{collections::BTreeMap, fs, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeConfig {
@@ -13,26 +13,37 @@ pub struct RuntimeConfig {
     pub protocol_version: Option<String>,
     pub auth_token: Option<String>,
     pub backends: Option<Vec<BackendConfig>>,
+    pub mesh: Option<MeshConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendConfig {
-    Synthetic { name: String },
-    Mlx { python: String, model: String },
-    Vllm { base_url: String, api_key: Option<String> },
+    Synthetic {
+        name: String,
+    },
+    Mlx {
+        python: String,
+        model: String,
+    },
+    Vllm {
+        base_url: String,
+        api_key: Option<String>,
+    },
 }
 
 pub fn load(path: Option<&Path>) -> Result<RuntimeConfig> {
     match path {
         Some(path) => {
-            let raw = fs::read_to_string(path).with_context(|| format!("failed to read config {}", path.display()))?;
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read config {}", path.display()))?;
             Ok(toml::from_str(&raw).context("failed to parse TOML runtime config")?)
         }
         None => {
             let default = Path::new("zeitgeist.toml");
             if default.exists() {
-                let raw = fs::read_to_string(default).with_context(|| format!("failed to read config {}", default.display()))?;
+                let raw = fs::read_to_string(default)
+                    .with_context(|| format!("failed to read config {}", default.display()))?;
                 Ok(toml::from_str(&raw).context("failed to parse TOML runtime config")?)
             } else {
                 Ok(RuntimeConfig::default())
@@ -53,7 +64,11 @@ pub fn node_identity(config: &RuntimeConfig) -> NodeIdentity {
             .unwrap_or_else(|| "0.1.0".into()),
         transports: vec!["in_process".into(), "tcp".into(), "quic".into()],
         trust_level: TrustLevel::TrustedExecutor,
-        auth_modes: vec![AuthMode::None, AuthMode::SharedToken, AuthMode::SignedNodeIdentity],
+        auth_modes: vec![
+            AuthMode::None,
+            AuthMode::SharedToken,
+            AuthMode::SignedNodeIdentity,
+        ],
         hardware: HardwareProfile {
             architecture: std::env::consts::ARCH.into(),
             accelerator: if cfg!(target_os = "macos") {
@@ -81,15 +96,28 @@ pub fn backends(config: &RuntimeConfig) -> Vec<SharedBackend> {
         .map(|entry| match entry {
             BackendConfig::Synthetic { name } => {
                 let mut descriptor = default_descriptor(name);
-                descriptor.metadata.insert("mode".into(), "synthetic".into());
+                descriptor
+                    .metadata
+                    .insert("mode".into(), "synthetic".into());
                 Arc::new(SyntheticBackend::new(descriptor)) as SharedBackend
             }
-            BackendConfig::Mlx { python, model } => Arc::new(MlxBackend::new(python.clone(), model.clone())) as SharedBackend,
+            BackendConfig::Mlx { python, model } => {
+                Arc::new(MlxBackend::new(python.clone(), model.clone())) as SharedBackend
+            }
             BackendConfig::Vllm { base_url, api_key } => {
                 Arc::new(VllmBackend::new(base_url.clone(), api_key.clone())) as SharedBackend
             }
         })
         .collect()
+}
+
+pub fn mesh(config: &RuntimeConfig) -> Option<MeshConfig> {
+    config.mesh.clone().map(|mut mesh| {
+        if mesh.sync_interval_ms == 0 {
+            mesh.sync_interval_ms = 30_000;
+        }
+        mesh
+    })
 }
 
 pub fn models() -> Vec<ModelIdentity> {
@@ -166,7 +194,10 @@ pub fn kernels() -> Vec<KernelDescriptor> {
             implementation_target: "cuda".into(),
             op_type: "attention".into(),
             supported_dtypes: vec![DType::Fp8E4m3, DType::Fp8E5m2, DType::F16, DType::BF16],
-            supported_layouts: vec![TensorLayout::RowMajorContiguous, TensorLayout::BackendBlocked],
+            supported_layouts: vec![
+                TensorLayout::RowMajorContiguous,
+                TensorLayout::BackendBlocked,
+            ],
             supported_hardware: vec!["nvidia_gpu".into()],
             deterministic: false,
             memory_requirement_mb: 512,

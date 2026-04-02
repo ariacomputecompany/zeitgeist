@@ -1,16 +1,18 @@
-use crate::types::*;
-use anyhow::{Context, Result};
+use crate::{peer, types::*};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicU32, Ordering},
     },
 };
 use tokio::process::Command;
+use tokio::sync::RwLock;
 
 #[async_trait]
 pub trait BackendAdapter: Send + Sync {
@@ -20,6 +22,102 @@ pub trait BackendAdapter: Send + Sync {
 }
 
 pub type SharedBackend = Arc<dyn BackendAdapter>;
+
+pub struct RemotePeerBackend {
+    descriptor: BackendDescriptor,
+    node_id: String,
+    peer_tcp_addr: String,
+    management_url: Option<String>,
+    auth_token: Option<String>,
+    protocol_version: String,
+    upstream_backend_name: String,
+}
+
+impl RemotePeerBackend {
+    pub fn new(
+        node_id: String,
+        peer_tcp_addr: String,
+        management_url: Option<String>,
+        auth_token: Option<String>,
+        protocol_version: String,
+        mut descriptor: BackendDescriptor,
+    ) -> Self {
+        let upstream_backend_name = descriptor.name.clone();
+        descriptor.name = format!("{}/{}", node_id, descriptor.name);
+        descriptor.topology.locality = "mesh_remote".into();
+        descriptor.topology.hop_count = descriptor.topology.hop_count.saturating_add(1);
+        descriptor
+            .metadata
+            .insert("mesh_node_id".into(), node_id.clone());
+        descriptor
+            .metadata
+            .insert("mesh_peer_tcp_addr".into(), peer_tcp_addr.clone());
+        if let Some(management_url) = &management_url {
+            descriptor
+                .metadata
+                .insert("mesh_management_url".into(), management_url.clone());
+        }
+        Self {
+            descriptor,
+            node_id,
+            peer_tcp_addr,
+            management_url,
+            auth_token,
+            protocol_version,
+            upstream_backend_name,
+        }
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+}
+
+#[async_trait]
+impl BackendAdapter for RemotePeerBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn name(&self) -> &str {
+        &self.descriptor.name
+    }
+
+    async fn execute(&self, request: &JobRequest, _plan: &JobPlan) -> Result<JobResult> {
+        let mut forwarded = request.clone();
+        forwarded.preferred_backends = vec![self.upstream_backend_name.clone()];
+        let peer_request = peer::PeerRequest::ExecuteJob {
+            protocol_version: self.protocol_version.clone(),
+            auth_token: self.auth_token.clone(),
+            request: forwarded,
+        };
+        let response = match peer::send(&self.peer_tcp_addr, &peer_request).await {
+            Ok(response) => response,
+            Err(tcp_error) => {
+                let Some(management_url) = &self.management_url else {
+                    return Err(tcp_error);
+                };
+                peer::send_http(management_url, &peer_request)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "mesh peer {} TCP failed ({tcp_error}); HTTP fallback also failed",
+                            self.node_id
+                        )
+                    })?
+            }
+        };
+        match response {
+            peer::PeerResponse::ExecuteJob { record } => record
+                .result
+                .ok_or_else(|| anyhow!("remote peer {} returned no job result", self.node_id)),
+            peer::PeerResponse::Error { message, .. } => {
+                anyhow::bail!("remote peer {} execution failed: {}", self.node_id, message)
+            }
+            other => anyhow::bail!("unexpected mesh execute response: {:?}", other),
+        }
+    }
+}
 
 pub struct SyntheticBackend {
     descriptor: BackendDescriptor,
@@ -50,17 +148,18 @@ impl BackendAdapter for SyntheticBackend {
     }
 
     async fn execute(&self, request: &JobRequest, plan: &JobPlan) -> Result<JobResult> {
-        match self.descriptor.metadata.get("force_fail").map(String::as_str) {
+        match self
+            .descriptor
+            .metadata
+            .get("force_fail")
+            .map(String::as_str)
+        {
             Some("always") => anyhow::bail!("synthetic backend {} forced to fail", self.name()),
             Some("once") => {
                 if self
                     .failures_remaining
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                        if current > 0 {
-                            Some(current - 1)
-                        } else {
-                            None
-                        }
+                        if current > 0 { Some(current - 1) } else { None }
                     })
                     .is_ok()
                 {
@@ -76,8 +175,12 @@ impl BackendAdapter for SyntheticBackend {
             .fold(0u64, |acc, byte| acc + u64::from(byte))
             + token_count as u64;
         let text = match request.job_type {
-            JobType::Embedding => format!("embedding:{}:{}:{}", self.name(), plan.mode_string(), seed),
-            JobType::ChatCompletion | JobType::TextCompletion | JobType::DistributedShardExecution => {
+            JobType::Embedding => {
+                format!("embedding:{}:{}:{}", self.name(), plan.mode_string(), seed)
+            }
+            JobType::ChatCompletion
+            | JobType::TextCompletion
+            | JobType::DistributedShardExecution => {
                 format!(
                     "[{}:{}] {}",
                     self.name(),
@@ -85,7 +188,11 @@ impl BackendAdapter for SyntheticBackend {
                     request.prompt.chars().take(120).collect::<String>()
                 )
             }
-            _ => format!("[{}] executed {}", self.name(), serde_json::to_string(&request.job_type)?),
+            _ => format!(
+                "[{}] executed {}",
+                self.name(),
+                serde_json::to_string(&request.job_type)?
+            ),
         };
         let embeddings = if request.job_type == JobType::Embedding {
             Some(
@@ -100,7 +207,11 @@ impl BackendAdapter for SyntheticBackend {
         Ok(JobResult {
             text,
             tokens: token_count,
-            latency_ms: if request.determinism.low_latency { 8 } else { 16 },
+            latency_ms: if request.determinism.low_latency {
+                8
+            } else {
+                16
+            },
             backend: self.name().to_string(),
             embeddings,
         })
@@ -116,8 +227,15 @@ pub struct MlxBackend {
 impl MlxBackend {
     pub fn new(python: String, model: String) -> Self {
         let mut metadata = BTreeMap::new();
-        metadata.insert("execution_surface".into(), "mlx_lm.load + generate/stream_generate".into());
+        metadata.insert(
+            "execution_surface".into(),
+            "mlx_lm.load + generate/stream_generate".into(),
+        );
         metadata.insert("interchange_hint".into(), "buffer_protocol, dlpack".into());
+        let mut model_families = vec!["llama".to_string(), "mistral".to_string()];
+        if model.to_ascii_lowercase().contains("qwen") {
+            model_families.push("qwen".into());
+        }
         Self {
             descriptor: BackendDescriptor {
                 name: "mlx".into(),
@@ -137,8 +255,12 @@ impl MlxBackend {
                     verified: true,
                     signature: Some("sig:verified".into()),
                 }),
-                execution_modes: vec![ExecutionMode::Solo, ExecutionMode::RoutedServing, ExecutionMode::PipelineParallel],
-                model_families: vec!["llama".into(), "mistral".into()],
+                execution_modes: vec![
+                    ExecutionMode::Solo,
+                    ExecutionMode::RoutedServing,
+                    ExecutionMode::PipelineParallel,
+                ],
+                model_families,
                 quantization: vec![QuantFormat::None, QuantFormat::Q4, QuantFormat::Q8],
                 dtypes: vec![DType::F16, DType::BF16, DType::F32],
                 attention: vec![AttentionVariant::Standard, AttentionVariant::Flash],
@@ -213,13 +335,20 @@ pub struct VllmBackend {
     base_url: String,
     api_key: Option<String>,
     client: reqwest::Client,
+    model_aliases: RwLock<BTreeMap<String, String>>,
 }
 
 impl VllmBackend {
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
         let mut metadata = BTreeMap::new();
-        metadata.insert("execution_surface".into(), "OpenAI-compatible HTTP server".into());
-        metadata.insert("kv_cache_dtype".into(), "auto, fp8, fp8_e4m3, fp8_e5m2".into());
+        metadata.insert(
+            "execution_surface".into(),
+            "OpenAI-compatible HTTP server".into(),
+        );
+        metadata.insert(
+            "kv_cache_dtype".into(),
+            "auto, fp8, fp8_e4m3, fp8_e5m2".into(),
+        );
         Self {
             descriptor: BackendDescriptor {
                 name: "vllm".into(),
@@ -239,9 +368,18 @@ impl VllmBackend {
                     verified: true,
                     signature: Some("sig:verified".into()),
                 }),
-                execution_modes: vec![ExecutionMode::Solo, ExecutionMode::RoutedServing, ExecutionMode::PipelineParallel],
+                execution_modes: vec![
+                    ExecutionMode::Solo,
+                    ExecutionMode::RoutedServing,
+                    ExecutionMode::PipelineParallel,
+                ],
                 model_families: vec!["llama".into(), "mistral".into(), "qwen".into()],
-                quantization: vec![QuantFormat::None, QuantFormat::Fp8, QuantFormat::Q4, QuantFormat::Q8],
+                quantization: vec![
+                    QuantFormat::None,
+                    QuantFormat::Fp8,
+                    QuantFormat::Q4,
+                    QuantFormat::Q8,
+                ],
                 dtypes: vec![DType::Fp8E4m3, DType::Fp8E5m2, DType::F16, DType::BF16],
                 attention: vec![AttentionVariant::Standard, AttentionVariant::Flash],
                 cache: vec![CacheDescriptor {
@@ -255,7 +393,10 @@ impl VllmBackend {
                     compression: Some("fp8".into()),
                     transferable: true,
                 }],
-                tensor_layouts: vec![TensorLayout::RowMajorContiguous, TensorLayout::BackendBlocked],
+                tensor_layouts: vec![
+                    TensorLayout::RowMajorContiguous,
+                    TensorLayout::BackendBlocked,
+                ],
                 parallelism: vec![
                     ExecutionMode::Solo,
                     ExecutionMode::RoutedServing,
@@ -272,7 +413,62 @@ impl VllmBackend {
             base_url,
             api_key,
             client: reqwest::Client::new(),
+            model_aliases: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    async fn resolve_model_id(&self, requested_model_id: &str) -> String {
+        if let Some(alias) = self
+            .model_aliases
+            .read()
+            .await
+            .get(requested_model_id)
+            .cloned()
+        {
+            return alias;
+        }
+
+        let mut headers = HeaderMap::new();
+        if let Some(api_key) = &self.api_key {
+            match HeaderValue::from_str(&format!("Bearer {api_key}")) {
+                Ok(value) => {
+                    headers.insert(AUTHORIZATION, value);
+                }
+                Err(_) => return requested_model_id.to_string(),
+            }
+        }
+
+        let response = match self
+            .client
+            .get(format!("{}/v1/models", self.base_url.trim_end_matches('/')))
+            .headers(headers)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return requested_model_id.to_string(),
+        };
+        if !response.status().is_success() {
+            return requested_model_id.to_string();
+        }
+
+        let payload: VllmModelsResponse = match response.json().await {
+            Ok(payload) => payload,
+            Err(_) => return requested_model_id.to_string(),
+        };
+
+        let mut aliases = self.model_aliases.write().await;
+        for model in payload.data {
+            aliases.insert(model.id.clone(), model.id.clone());
+            if let Some(root) = model.root {
+                aliases.insert(root, model.id.clone());
+            }
+        }
+
+        aliases
+            .get(requested_model_id)
+            .cloned()
+            .unwrap_or_else(|| requested_model_id.to_string())
     }
 }
 
@@ -287,6 +483,7 @@ impl BackendAdapter for VllmBackend {
     }
 
     async fn execute(&self, request: &JobRequest, _plan: &JobPlan) -> Result<JobResult> {
+        let upstream_model_id = self.resolve_model_id(&request.model_id).await;
         let endpoint = match request.job_type {
             JobType::Embedding => "/v1/embeddings",
             _ => "/v1/chat/completions",
@@ -299,11 +496,11 @@ impl BackendAdapter for VllmBackend {
         }
         let body = match request.job_type {
             JobType::Embedding => json!({
-                "model": request.model_id,
+                "model": upstream_model_id,
                 "input": request.prompt,
             }),
             _ => json!({
-                "model": request.model_id,
+                "model": upstream_model_id,
                 "messages": [{"role": "user", "content": request.prompt}],
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature,
@@ -311,7 +508,11 @@ impl BackendAdapter for VllmBackend {
         };
         let response = self
             .client
-            .post(format!("{}{}", self.base_url.trim_end_matches('/'), endpoint))
+            .post(format!(
+                "{}{}",
+                self.base_url.trim_end_matches('/'),
+                endpoint
+            ))
             .headers(headers)
             .json(&body)
             .send()
@@ -370,9 +571,27 @@ pub fn default_backends() -> Vec<SharedBackend> {
 }
 
 pub fn synthetic_backends() -> Vec<SharedBackend> {
-    let mlx = SyntheticBackend::new(MlxBackend::new("python3".into(), "mlx-community/Llama-3.2-1B-Instruct-4bit".into()).descriptor());
-    let vllm = SyntheticBackend::new(VllmBackend::new("http://127.0.0.1:8000".into(), None).descriptor());
+    let mlx = SyntheticBackend::new(
+        MlxBackend::new(
+            "python3".into(),
+            "mlx-community/Llama-3.2-1B-Instruct-4bit".into(),
+        )
+        .descriptor(),
+    );
+    let vllm =
+        SyntheticBackend::new(VllmBackend::new("http://127.0.0.1:8000".into(), None).descriptor());
     vec![Arc::new(mlx), Arc::new(vllm)]
+}
+
+#[derive(Debug, Deserialize)]
+struct VllmModelsResponse {
+    data: Vec<VllmModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VllmModelEntry {
+    id: String,
+    root: Option<String>,
 }
 
 trait PlanModeString {
@@ -390,5 +609,114 @@ impl PlanModeString for JobPlan {
             ExecutionMode::Hybrid => "hybrid",
             ExecutionMode::ClientOnly => "client_only",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::State, routing::get, routing::post};
+    use std::{net::SocketAddr, sync::Arc as StdArc};
+    use tokio::net::TcpListener;
+
+    #[derive(Clone, Default)]
+    struct MockState {
+        seen_models: StdArc<RwLock<Vec<String>>>,
+    }
+
+    #[tokio::test]
+    async fn vllm_backend_resolves_root_model_to_served_model_id() {
+        async fn models() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "served-qwen",
+                    "root": "Qwen/Qwen2.5-0.5B-Instruct"
+                }]
+            }))
+        }
+
+        async fn completions(
+            State(state): State<MockState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state.seen_models.write().await.push(
+                body.get("model")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            Json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "ok"
+                    }
+                }]
+            }))
+        }
+
+        let state = MockState::default();
+        let app = Router::new()
+            .route("/v1/models", get(models))
+            .route("/v1/chat/completions", post(completions))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let backend = VllmBackend::new(format!("http://{addr}"), None);
+        let result = backend
+            .execute(
+                &JobRequest {
+                    model_id: "Qwen/Qwen2.5-0.5B-Instruct".into(),
+                    job_type: JobType::ChatCompletion,
+                    prompt: "hello".into(),
+                    session_id: None,
+                    preferred_backends: vec!["vllm".into()],
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    determinism: DeterminismPolicy {
+                        strict_correctness: true,
+                        deterministic: true,
+                        low_latency: true,
+                        high_availability: false,
+                    },
+                },
+                &JobPlan {
+                    session_id: uuid::Uuid::nil(),
+                    mode: ExecutionMode::Solo,
+                    compatibility: CompatibilityReport {
+                        outcome: CompatibilityOutcome::FullyCompatible,
+                        execution_mode: ExecutionMode::Solo,
+                        convertible: false,
+                        reasons: vec![],
+                        selected_peers: vec!["vllm".into()],
+                    },
+                    participants: vec![],
+                    tensor_layout: TensorLayout::RowMajorContiguous,
+                    cache: Some(CacheDescriptor {
+                        version: "zgc-1".into(),
+                        dtype: DType::F16,
+                        layout: TensorLayout::RowMajorContiguous,
+                        head_grouping: "grouped-query".into(),
+                        rope_state: PositionEncoding::Rope,
+                        sequence_indexing: "absolute".into(),
+                        eviction: "lru".into(),
+                        compression: None,
+                        transferable: true,
+                    }),
+                    fallback_modes: vec![ExecutionMode::Solo],
+                    estimated_cost: 1,
+                    replan_generation: 0,
+                    partial_failure_tolerance: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "ok");
+        assert_eq!(state.seen_models.read().await.as_slice(), ["served-qwen"]);
     }
 }

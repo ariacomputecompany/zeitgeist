@@ -1,5 +1,5 @@
 use crate::types::{CacheBlob, TensorFrame};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 const TENSOR_MAGIC: &[u8; 5] = b"ZGTN1";
 const CACHE_MAGIC: &[u8; 5] = b"ZGKC1";

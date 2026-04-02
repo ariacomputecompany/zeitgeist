@@ -1,17 +1,15 @@
-use crate::{codec, runtime::Runtime, types::*};
+use crate::{codec, peer, runtime::Runtime, types::*};
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::HeaderMap,
     http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-    },
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
-    Json, Router,
 };
 use schemars::schema_for;
 use std::{convert::Infallible, time::Duration};
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use uuid::Uuid;
 
 pub fn router(runtime: Runtime) -> Router {
@@ -26,6 +24,10 @@ pub fn router(runtime: Runtime) -> Router {
         .route("/v1/transport-health", get(transport_health))
         .route("/v1/planner-decisions", get(planner_decisions))
         .route("/v1/topology", get(topology))
+        .route("/v1/mesh/peers", get(mesh_peers))
+        .route("/v1/mesh/register", post(mesh_register))
+        .route("/v1/mesh/sync", post(mesh_sync))
+        .route("/v1/peer/request", post(peer_request))
         .route("/v1/schema", get(schema))
         .route("/v1/compatibility", post(compatibility))
         .route("/v1/plan", post(plan))
@@ -84,6 +86,46 @@ async fn topology(State(runtime): State<Runtime>) -> Json<TopologyView> {
     Json(runtime.topology().await)
 }
 
+async fn mesh_peers(State(runtime): State<Runtime>) -> Json<Vec<MeshPeerRecord>> {
+    Json(runtime.mesh_peers())
+}
+
+async fn mesh_register(
+    State(runtime): State<Runtime>,
+    headers: HeaderMap,
+    Json(request): Json<MeshRegistrationRequest>,
+) -> Result<Json<MeshRegistrationResponse>, (StatusCode, Json<serde_json::Value>)> {
+    require_protocol_version(&headers, &runtime)?;
+    require_auth(&headers, &runtime)?;
+    runtime
+        .register_mesh_peer(request)
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn mesh_sync(
+    State(runtime): State<Runtime>,
+    headers: HeaderMap,
+) -> Result<Json<MeshSyncResponse>, (StatusCode, Json<serde_json::Value>)> {
+    require_protocol_version(&headers, &runtime)?;
+    require_auth(&headers, &runtime)?;
+    runtime
+        .sync_mesh_once()
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn peer_request(
+    State(runtime): State<Runtime>,
+    headers: HeaderMap,
+    Json(request): Json<peer::PeerRequest>,
+) -> Result<Json<peer::PeerResponse>, (StatusCode, Json<serde_json::Value>)> {
+    require_protocol_version(&headers, &runtime)?;
+    require_auth(&headers, &runtime)?;
+    Ok(Json(peer::route_request(&runtime, request).await))
+}
+
 async fn schema() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "capability_snapshot": schema_for!(CapabilitySnapshot),
@@ -95,6 +137,10 @@ async fn schema() -> Json<serde_json::Value> {
         "transport_health": schema_for!(TransportHealth),
         "planner_decision_record": schema_for!(PlannerDecisionRecord),
         "topology_view": schema_for!(TopologyView),
+        "mesh_peer_record": schema_for!(MeshPeerRecord),
+        "mesh_registration_request": schema_for!(MeshRegistrationRequest),
+        "mesh_registration_response": schema_for!(MeshRegistrationResponse),
+        "mesh_sync_response": schema_for!(MeshSyncResponse),
         "job_stream_chunk": schema_for!(JobStreamChunk),
         "tensor_roundtrip_request": schema_for!(TensorRoundTripRequest),
         "cache_roundtrip_request": schema_for!(CacheRoundTripRequest)
@@ -108,8 +154,7 @@ async fn compatibility(
 ) -> Result<Json<CompatibilityReport>, (StatusCode, Json<serde_json::Value>)> {
     require_protocol_version(&headers, &runtime)?;
     require_auth(&headers, &runtime)?;
-    Json(runtime.compatibility(&request))
-        .pipe(Ok)
+    Json(runtime.compatibility(&request)).pipe(Ok)
 }
 
 async fn plan(
@@ -129,17 +174,27 @@ async fn submit_job(
 ) -> Result<Json<JobRecord>, (StatusCode, Json<serde_json::Value>)> {
     require_protocol_version(&headers, &runtime)?;
     require_auth(&headers, &runtime)?;
-    runtime.submit_job(request).await.map(Json).map_err(internal_error)
+    runtime
+        .submit_job(request)
+        .await
+        .map(Json)
+        .map_err(internal_error)
 }
 
 async fn stream_job(
     State(runtime): State<Runtime>,
     headers: HeaderMap,
     Json(request): Json<JobRequest>,
-) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<
+    Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<serde_json::Value>),
+> {
     require_protocol_version(&headers, &runtime)?;
     require_auth(&headers, &runtime)?;
-    let (record, stream) = runtime.submit_job_stream(request).await.map_err(internal_error)?;
+    let (record, stream) = runtime
+        .submit_job_stream(request)
+        .await
+        .map_err(internal_error)?;
     let initial = tokio_stream::once(Ok(Event::default().event("job").data(
         serde_json::to_string(&serde_json::json!({
             "job_id": record.job_id,
@@ -149,10 +204,15 @@ async fn stream_job(
         .unwrap(),
     )));
     let chunks = stream.map(|item| match item {
-        Ok(chunk) => Ok(Event::default().event("chunk").data(serde_json::to_string(&chunk).unwrap())),
-        Err(error) => Ok(Event::default().event("error").data(serde_json::json!({"error": error.to_string()}).to_string())),
+        Ok(chunk) => Ok(Event::default()
+            .event("chunk")
+            .data(serde_json::to_string(&chunk).unwrap())),
+        Err(error) => Ok(Event::default()
+            .event("error")
+            .data(serde_json::json!({"error": error.to_string()}).to_string())),
     });
-    Ok(Sse::new(initial.chain(chunks)).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
+    Ok(Sse::new(initial.chain(chunks))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
 }
 
 async fn list_jobs(State(runtime): State<Runtime>) -> Json<Vec<JobRecord>> {
@@ -163,11 +223,12 @@ async fn job(
     State(runtime): State<Runtime>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<JobRecord>, (StatusCode, Json<serde_json::Value>)> {
-    runtime
-        .job(job_id)
-        .await
-        .map(Json)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "job not found" }))))
+    runtime.job(job_id).await.map(Json).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "job not found" })),
+        )
+    })
 }
 
 async fn cancel_job(
@@ -177,7 +238,11 @@ async fn cancel_job(
 ) -> Result<Json<JobCancellation>, (StatusCode, Json<serde_json::Value>)> {
     require_protocol_version(&headers, &runtime)?;
     require_auth(&headers, &runtime)?;
-    runtime.cancel_job(job_id).await.map(Json).map_err(internal_error)
+    runtime
+        .cancel_job(job_id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
 }
 
 async fn tensor_roundtrip(
@@ -311,6 +376,19 @@ fn require_auth(
 }
 
 pub async fn serve(runtime: Runtime, bind: &str) -> anyhow::Result<()> {
+    if let Some(mesh) = runtime.mesh_config() {
+        if !mesh.peers.is_empty() {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                let interval_ms = mesh.sync_interval_ms.max(1_000);
+                let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                loop {
+                    interval.tick().await;
+                    let _ = runtime.sync_mesh_once().await;
+                }
+            });
+        }
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, router(runtime)).await?;
     Ok(())
@@ -335,6 +413,7 @@ mod tests {
             synthetic_backends(),
             config::models(),
             config::kernels(),
+            None,
             None,
         )
     }
@@ -494,6 +573,7 @@ mod tests {
             config::models(),
             config::kernels(),
             Some("secret-token".into()),
+            None,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

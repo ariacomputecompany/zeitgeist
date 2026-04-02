@@ -1103,7 +1103,7 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Live backends are the shipped default runtime path.
 - ✅ Synthetic backend for deterministic certification.
 - ✅ MLX-shaped adapter.
-- ✅ vLLM OpenAI-compatible proxy-shaped adapter.
+- ✅ vLLM OpenAI-compatible adapter with upstream served-model alias resolution.
 - ✅ Kernel descriptor surface.
 - ⬜ Dynamic plugin loading ABI.
 - ⬜ Real llama.cpp adapter.
@@ -1137,6 +1137,7 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Transport health API.
 - ✅ Planner decision audit API with persistent histories.
 - ✅ Topology UI schema/API.
+- ✅ Mesh peer registry and sync APIs.
 
 ### 26.15 API Surfaces
 
@@ -1146,6 +1147,7 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Tensor/cache roundtrip verification APIs exist.
 - ✅ Peer-wire TCP endpoints for node-to-node negotiation/planning.
 - ✅ Peer-wire TCP remote execution endpoint.
+- ✅ Mesh management HTTP endpoints for peer registration and sync.
 - ⬜ gRPC transport.
 
 ### 26.16 Ecosystem and Open Source Strategy
@@ -1176,5 +1178,8 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Live QUIC peer handshake/capabilities/remote execution validation against a running runtime.
 - ✅ Quilt Linux vLLM installation/import verification.
 - ✅ Live MLX end-to-end inference through the real adapter.
+- ✅ Live mesh remote execution through a second Zeitgeist node.
+- ✅ Live mesh host-backed Fozzy doctor/test/run/trace verify/replay/ci path.
 - ✅ Live vLLM end-to-end inference through a real remote server.
 - ✅ Live default-config vLLM job execution through the Rust runtime.
+- ✅ Live vLLM Fozzy deterministic doctor/test/run/trace verify/replay/ci path.

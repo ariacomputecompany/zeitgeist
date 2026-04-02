@@ -6,3 +6,4 @@
 /.fozzy/corpus
 /.fozzy/runs
 /tmp
+/.env

@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "name": "vllm-live-pass",
+  "steps": [
+    {
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "--",
+        "--config",
+        "/tmp/zeitgeist-vllm-live.toml",
+        "smoke",
+        "--model-id",
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "--backend",
+        "vllm",
+        "--prompt",
+        "Reply with exactly: ZEITGEIST_VLLM_OK"
+      ],
+      "exit_code": 0,
+      "stdout": "{\"backend\":\"vllm\",\"mode\":\"solo\",\"status\":\"completed\",\"text\":\"ZEITGEIST_VLLM_OK\",\"tokens\":16}\n",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "--",
+        "--config",
+        "/tmp/zeitgeist-vllm-live.toml",
+        "smoke",
+        "--model-id",
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "--backend",
+        "vllm",
+        "--prompt",
+        "Reply with exactly: ZEITGEIST_VLLM_OK"
+      ],
+      "expect_exit": 0,
+      "expect_stdout": "{\"backend\":\"vllm\",\"mode\":\"solo\",\"status\":\"completed\",\"text\":\"ZEITGEIST_VLLM_OK\",\"tokens\":16}\n",
+      "expect_stderr": ""
+    },
+    {
+      "type": "http_request",
+      "method": "GET",
+      "path": "http://127.0.0.1:18182/v1/models",
+      "expect_status": 200
+    },
+    {
+      "type": "http_request",
+      "method": "POST",
+      "path": "http://127.0.0.1:18182/v1/jobs",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer dev-token",
+        "x-zeitgeist-protocol-version": "0.1.0"
+      },
+      "body": "{\"model_id\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"job_type\":\"chat_completion\",\"prompt\":\"Reply with exactly: ZEITGEIST_VLLM_HTTP_OK\",\"session_id\":\"00000000-0000-0000-0000-000000000000\",\"preferred_backends\":[\"vllm\"],\"max_tokens\":16,\"temperature\":0.0,\"determinism\":{\"strict_correctness\":true,\"deterministic\":true,\"low_latency\":true,\"high_availability\":false}}",
+      "expect_status": 200,
+      "save_body_as": "vllm_http_job"
+    }
+  ]
+}

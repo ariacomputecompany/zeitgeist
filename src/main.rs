@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
-use zeitgeist::{api, config, peer, Runtime};
+use zeitgeist::{Runtime, api, config, peer};
 
 #[derive(Parser)]
 #[command(author, version, about = "Zeitgeist reference runtime")]
@@ -43,6 +43,10 @@ enum Command {
     Smoke {
         #[arg(long, default_value = "mesh prompt")]
         prompt: String,
+        #[arg(long, default_value = "llama-3.2-3b-instruct")]
+        model_id: String,
+        #[arg(long, default_value = "mlx")]
+        backend: String,
     },
     PeerPing {
         #[arg(long, default_value = "127.0.0.1:9090")]
@@ -100,13 +104,16 @@ enum Command {
         #[arg(long, default_value = "remote execute")]
         prompt: String,
     },
+    MeshPeers,
+    MeshSync,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,zeitgeist=debug")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,zeitgeist=debug")),
         )
         .init();
 
@@ -118,12 +125,18 @@ async fn main() -> anyhow::Result<()> {
         config::models(),
         config::kernels(),
         config.auth_token.clone(),
+        config::mesh(&config),
     );
 
     match cli.command {
         Command::Serve { bind } => api::serve(runtime, &bind).await,
         Command::ServePeer { bind } => peer::serve(runtime, &bind).await,
-        Command::ServePeerQuic { bind, cert, key, client_ca_cert } => peer::serve_quic(runtime, &bind, &cert, &key, client_ca_cert.as_deref()).await,
+        Command::ServePeerQuic {
+            bind,
+            cert,
+            key,
+            client_ca_cert,
+        } => peer::serve_quic(runtime, &bind, &cert, &key, client_ca_cert.as_deref()).await,
         Command::ServePeerUnix { path } => peer::serve_unix(runtime, &path).await,
         Command::Describe { pretty } => {
             let payload = runtime.capabilities();
@@ -134,14 +147,18 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Smoke { prompt } => {
+        Command::Smoke {
+            prompt,
+            model_id,
+            backend,
+        } => {
             let record = runtime
                 .submit_job(zeitgeist::types::JobRequest {
-                    model_id: "llama-3.2-3b-instruct".into(),
+                    model_id,
                     job_type: zeitgeist::types::JobType::ChatCompletion,
                     prompt,
                     session_id: Some(uuid::Uuid::nil()),
-                    preferred_backends: vec!["mlx".into()],
+                    preferred_backends: vec![backend],
                     max_tokens: 16,
                     temperature: 0.0,
                     determinism: zeitgeist::types::DeterminismPolicy {
@@ -188,7 +205,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         }
-        Command::PeerCapabilitiesQuic { addr, server_name, ca_cert, client_cert, client_key } => {
+        Command::PeerCapabilitiesQuic {
+            addr,
+            server_name,
+            ca_cert,
+            client_cert,
+            client_key,
+        } => {
             let response = peer::send_quic(
                 &addr,
                 &server_name,
@@ -218,7 +241,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         }
-        Command::PeerPingQuic { addr, server_name, ca_cert, client_cert, client_key } => {
+        Command::PeerPingQuic {
+            addr,
+            server_name,
+            ca_cert,
+            client_cert,
+            client_key,
+        } => {
             let response = peer::send_quic(
                 &addr,
                 &server_name,
@@ -263,7 +292,14 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         }
-        Command::PeerExecuteQuic { addr, server_name, ca_cert, client_cert, client_key, prompt } => {
+        Command::PeerExecuteQuic {
+            addr,
+            server_name,
+            ca_cert,
+            client_cert,
+            client_key,
+            prompt,
+        } => {
             let response = peer::send_quic(
                 &addr,
                 &server_name,
@@ -292,6 +328,17 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             println!("{}", serde_json::to_string(&response)?);
+            Ok(())
+        }
+        Command::MeshPeers => {
+            println!("{}", serde_json::to_string(&runtime.mesh_peers())?);
+            Ok(())
+        }
+        Command::MeshSync => {
+            println!(
+                "{}",
+                serde_json::to_string(&runtime.sync_mesh_once().await?)?
+            );
             Ok(())
         }
     }
