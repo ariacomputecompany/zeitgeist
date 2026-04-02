@@ -1,6 +1,8 @@
 /target
 /.venv
+/.fozzy
 /.fozzy/out
 /.fozzy/traces
 /.fozzy/corpus
+/.fozzy/runs
 /tmp

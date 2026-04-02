@@ -1020,7 +1020,7 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Protocol Gateway.
 - ✅ Metrics/Tracing layer via runtime events plus Fozzy artifacts/profile outputs.
 - ✅ Recovery Manager with active failover execution.
-- ⬜ Recovery Manager with active replan execution.
+- ✅ Recovery Manager with active replan execution.
 - ⬜ Compatibility Validator as a dedicated external certification tool.
 
 ### 26.3 Protocol Objects
@@ -1045,9 +1045,9 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Solo execution planning.
 - ✅ Routed serving planning.
 - ✅ Pipeline-parallel planning surface.
-- ⬜ Tensor-parallel runtime execution.
-- ⬜ Expert-parallel runtime execution.
-- ⬜ Hybrid runtime execution.
+- ✅ Tensor-parallel runtime execution.
+- ✅ Expert-parallel runtime execution.
+- ✅ Hybrid runtime execution.
 - ✅ Client-only incompatibility outcome.
 
 ### 26.6 Tensor Interoperability
@@ -1113,9 +1113,9 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Compatibility-aware planning.
 - ✅ Fallback modes included in plans.
 - ✅ Latency-aware deterministic policy input modeled.
-- ⬜ Topology-aware cost model.
-- ⬜ Memory-pressure-aware repartitioning.
-- ⬜ Trust-aware peer exclusion in live scheduling.
+- ✅ Topology-aware cost model.
+- ✅ Memory-pressure-aware repartitioning.
+- ✅ Trust-aware peer exclusion in live scheduling.
 
 ### 26.13 Failure Handling and Recovery
 
@@ -1124,9 +1124,9 @@ This checklist is the current source-of-truth status against this spec.
 - ✅ Operator cancellation path.
 - ✅ Retry alternate peer.
 - ✅ Degrade to solo/routed fallback automatically.
-- ⬜ Retry same peer.
+- ✅ Retry same peer.
 - ⬜ Rehydrate cache.
-- ⬜ Partial failure surfacing for distributed execution.
+- ✅ Partial failure surfacing for distributed execution.
 
 ### 26.14 Observability and Operator Surfaces
 

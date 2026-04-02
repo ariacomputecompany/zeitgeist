@@ -3,7 +3,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::json;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 use tokio::process::Command;
 
 #[async_trait]
@@ -17,11 +23,19 @@ pub type SharedBackend = Arc<dyn BackendAdapter>;
 
 pub struct SyntheticBackend {
     descriptor: BackendDescriptor,
+    failures_remaining: AtomicU32,
 }
 
 impl SyntheticBackend {
     pub fn new(descriptor: BackendDescriptor) -> Self {
-        Self { descriptor }
+        let failures_remaining = match descriptor.metadata.get("force_fail").map(String::as_str) {
+            Some("once") => 1,
+            _ => 0,
+        };
+        Self {
+            descriptor,
+            failures_remaining: AtomicU32::new(failures_remaining),
+        }
     }
 }
 
@@ -36,13 +50,24 @@ impl BackendAdapter for SyntheticBackend {
     }
 
     async fn execute(&self, request: &JobRequest, plan: &JobPlan) -> Result<JobResult> {
-        if self
-            .descriptor
-            .metadata
-            .get("force_fail")
-            .is_some_and(|mode| mode == "always")
-        {
-            anyhow::bail!("synthetic backend {} forced to fail", self.name());
+        match self.descriptor.metadata.get("force_fail").map(String::as_str) {
+            Some("always") => anyhow::bail!("synthetic backend {} forced to fail", self.name()),
+            Some("once") => {
+                if self
+                    .failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        if current > 0 {
+                            Some(current - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+                {
+                    anyhow::bail!("synthetic backend {} forced transient failure", self.name());
+                }
+            }
+            _ => {}
         }
         let token_count = request.max_tokens.min(64);
         let seed = request
@@ -97,6 +122,20 @@ impl MlxBackend {
             descriptor: BackendDescriptor {
                 name: "mlx".into(),
                 version: "proxy".into(),
+                trust_level: TrustLevel::TrustedExecutor,
+                topology: BackendTopologyHints {
+                    locality: "local".into(),
+                    zone: "apple_silicon".into(),
+                    hop_count: 0,
+                    base_latency_ms: 2,
+                },
+                memory_budget_mb: 12 * 1024,
+                attestation: Some(BackendAttestation {
+                    format: "artifact_hash".into(),
+                    signer: "zeitgeist-local".into(),
+                    artifact_hash: "sha256:mlx-backend-attestation".into(),
+                    verified: true,
+                }),
                 execution_modes: vec![ExecutionMode::Solo, ExecutionMode::RoutedServing, ExecutionMode::PipelineParallel],
                 model_families: vec!["llama".into(), "mistral".into()],
                 quantization: vec![QuantFormat::None, QuantFormat::Q4, QuantFormat::Q8],
@@ -114,7 +153,13 @@ impl MlxBackend {
                     transferable: true,
                 }],
                 tensor_layouts: vec![TensorLayout::RowMajorContiguous],
-                parallelism: vec![ExecutionMode::Solo, ExecutionMode::PipelineParallel],
+                parallelism: vec![
+                    ExecutionMode::Solo,
+                    ExecutionMode::PipelineParallel,
+                    ExecutionMode::TensorParallel,
+                    ExecutionMode::ExpertParallel,
+                    ExecutionMode::Hybrid,
+                ],
                 streaming: true,
                 batching: false,
                 extensions: vec!["metal".into(), "dlpack".into()],
@@ -178,6 +223,20 @@ impl VllmBackend {
             descriptor: BackendDescriptor {
                 name: "vllm".into(),
                 version: "proxy".into(),
+                trust_level: TrustLevel::TrustedExecutor,
+                topology: BackendTopologyHints {
+                    locality: "remote".into(),
+                    zone: "linux_gpu".into(),
+                    hop_count: 1,
+                    base_latency_ms: 8,
+                },
+                memory_budget_mb: 24 * 1024,
+                attestation: Some(BackendAttestation {
+                    format: "artifact_hash".into(),
+                    signer: "zeitgeist-linux".into(),
+                    artifact_hash: "sha256:vllm-backend-attestation".into(),
+                    verified: true,
+                }),
                 execution_modes: vec![ExecutionMode::Solo, ExecutionMode::RoutedServing, ExecutionMode::PipelineParallel],
                 model_families: vec!["llama".into(), "mistral".into(), "qwen".into()],
                 quantization: vec![QuantFormat::None, QuantFormat::Fp8, QuantFormat::Q4, QuantFormat::Q8],
@@ -195,7 +254,14 @@ impl VllmBackend {
                     transferable: true,
                 }],
                 tensor_layouts: vec![TensorLayout::RowMajorContiguous, TensorLayout::BackendBlocked],
-                parallelism: vec![ExecutionMode::Solo, ExecutionMode::RoutedServing, ExecutionMode::PipelineParallel],
+                parallelism: vec![
+                    ExecutionMode::Solo,
+                    ExecutionMode::RoutedServing,
+                    ExecutionMode::PipelineParallel,
+                    ExecutionMode::TensorParallel,
+                    ExecutionMode::ExpertParallel,
+                    ExecutionMode::Hybrid,
+                ],
                 streaming: true,
                 batching: true,
                 extensions: vec!["openai_compatible".into()],

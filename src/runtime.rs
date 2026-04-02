@@ -4,7 +4,7 @@ use crate::{
     types::*,
 };
 use anyhow::{anyhow, Result};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -27,6 +27,13 @@ struct Inner {
     cancelled_jobs: RwLock<BTreeMap<Uuid, JobStatus>>,
     auth_token: Option<String>,
     events: broadcast::Sender<EventEnvelope>,
+}
+
+struct ExecutionOutcome {
+    result: JobResult,
+    recovered: bool,
+    attempts: Vec<ExecutionAttempt>,
+    plan: JobPlan,
 }
 
 impl Runtime {
@@ -107,6 +114,7 @@ impl Runtime {
             plan: plan.clone(),
             result: None,
             error: None,
+            attempts: Vec::new(),
         };
         self.store(record.clone()).await;
         self.emit("job".into(), format!("job {} proposed", job_id));
@@ -116,19 +124,21 @@ impl Runtime {
         self.emit("job".into(), format!("job {} executing", job_id));
 
         match self.execute_with_recovery(&request, &record.plan, job_id).await {
-            Ok((result, recovered)) => {
-                record.status = if recovered {
+            Ok(outcome) => {
+                record.status = if outcome.recovered {
                     JobStatus::Recovered
                 } else {
                     JobStatus::Completed
                 };
-                record.result = Some(result);
+                record.plan = outcome.plan;
+                record.result = Some(outcome.result);
+                record.attempts = outcome.attempts;
                 self.emit(
                     "job".into(),
                     format!(
                         "job {} {}",
                         job_id,
-                        if recovered { "recovered" } else { "completed" }
+                        if matches!(record.status, JobStatus::Recovered) { "recovered" } else { "completed" }
                     ),
                 );
             }
@@ -283,6 +293,7 @@ impl Runtime {
             plan: plan.clone(),
             result: None,
             error: None,
+            attempts: Vec::new(),
         };
         self.store(record.clone()).await;
         self.emit("job".into(), format!("job {} streaming", job_id));
@@ -293,7 +304,8 @@ impl Runtime {
 
         tokio::spawn(async move {
             match runtime.execute_with_recovery(&request_clone, &plan, job_id).await {
-                Ok((result, recovered)) => {
+                Ok(outcome) => {
+                    let result = outcome.result;
                     for (index, token) in result.text.split_whitespace().enumerate() {
                         if runtime
                             .inner
@@ -343,12 +355,14 @@ impl Runtime {
                         .await;
                     let mut jobs = runtime.inner.jobs.write().await;
                     if let Some(stored) = jobs.get_mut(&job_id) {
-                        stored.status = if recovered {
+                        stored.status = if outcome.recovered {
                             JobStatus::Recovered
                         } else {
                             JobStatus::Completed
                         };
+                        stored.plan = outcome.plan;
                         stored.result = Some(result);
+                        stored.attempts = outcome.attempts;
                     }
                 }
                 Err(error) => {
@@ -371,26 +385,56 @@ impl Runtime {
         request: &JobRequest,
         plan: &JobPlan,
         job_id: Uuid,
-    ) -> Result<(JobResult, bool)> {
-        let candidates = self.execution_candidates(request, plan);
-        let mut last_error = None;
+    ) -> Result<ExecutionOutcome> {
+        let mut current_plan = plan.clone();
+        let mut attempts = Vec::new();
+        let mut failed_backends = BTreeSet::new();
         let mut recovered = false;
+        let mut last_error = None;
 
-        for (index, backend) in candidates.into_iter().enumerate() {
-            match backend.execute(request, plan).await {
+        loop {
+            if current_plan.participants.is_empty() {
+                break;
+            }
+
+            match self
+                .execute_plan_attempt(request, &current_plan, job_id, &mut attempts, current_plan.replan_generation > 0)
+                .await
+            {
                 Ok(result) => {
-                    return Ok((result, recovered));
+                    let recovered_now = recovered
+                        || attempts
+                            .iter()
+                            .any(|attempt| attempt.status == AttemptStatus::Failed || attempt.same_peer_retry);
+                    return Ok(ExecutionOutcome {
+                        result,
+                        recovered: recovered_now,
+                        attempts,
+                        plan: current_plan,
+                    });
                 }
                 Err(error) => {
-                    let backend_name = backend.name().to_string();
+                    last_error = Some(error);
+                    recovered = true;
+                    for participant in &current_plan.participants {
+                        if attempts
+                            .iter()
+                            .any(|attempt| attempt.backend == participant.backend && attempt.status == AttemptStatus::Failed)
+                        {
+                            failed_backends.insert(participant.backend.clone());
+                        }
+                    }
+                    let Some(next_plan) = self.replan_excluding(request, &current_plan, &failed_backends) else {
+                        break;
+                    };
                     self.emit(
                         "recovery".into(),
-                        format!("job {} backend {} failed: {}", job_id, backend_name, error),
+                        format!(
+                            "job {} replanned from generation {} to {}",
+                            job_id, current_plan.replan_generation, next_plan.replan_generation
+                        ),
                     );
-                    last_error = Some(error);
-                    if index == 0 {
-                        recovered = true;
-                    }
+                    current_plan = next_plan;
                 }
             }
         }
@@ -431,6 +475,256 @@ impl Runtime {
         }
 
         ordered
+    }
+
+    async fn execute_plan_attempt(
+        &self,
+        request: &JobRequest,
+        plan: &JobPlan,
+        job_id: Uuid,
+        attempts: &mut Vec<ExecutionAttempt>,
+        replanned: bool,
+    ) -> Result<JobResult> {
+        match plan.mode {
+            ExecutionMode::TensorParallel
+            | ExecutionMode::PipelineParallel
+            | ExecutionMode::ExpertParallel
+            | ExecutionMode::Hybrid => {
+                self.execute_distributed_attempt(request, plan, job_id, attempts, replanned).await
+            }
+            _ => self.execute_serial_attempt(request, plan, job_id, attempts, replanned).await,
+        }
+    }
+
+    async fn execute_serial_attempt(
+        &self,
+        request: &JobRequest,
+        plan: &JobPlan,
+        job_id: Uuid,
+        attempts: &mut Vec<ExecutionAttempt>,
+        replanned: bool,
+    ) -> Result<JobResult> {
+        let candidates = self.execution_candidates(request, plan);
+        let mut last_error = None;
+
+        for backend in candidates {
+            let backend_name = backend.name().to_string();
+            let attempt_number = attempts.len() as u32 + 1;
+            attempts.push(ExecutionAttempt {
+                attempt: attempt_number,
+                backend: backend_name.clone(),
+                mode: plan.mode.clone(),
+                status: AttemptStatus::Planned,
+                error: None,
+                same_peer_retry: false,
+                replanned,
+            });
+
+            match backend.execute(request, plan).await {
+                Ok(result) => {
+                    if let Some(attempt) = attempts.last_mut() {
+                        attempt.status = AttemptStatus::Succeeded;
+                    }
+                    return Ok(result);
+                }
+                Err(error) => {
+                    if let Some(attempt) = attempts.last_mut() {
+                        attempt.status = AttemptStatus::Failed;
+                        attempt.error = Some(error.to_string());
+                    }
+                    self.emit(
+                        "recovery".into(),
+                        format!("job {} backend {} failed: {}", job_id, backend_name, error),
+                    );
+                    if self.should_retry_same_peer(request, &backend_name, &error) {
+                        let retry_number = attempts.len() as u32 + 1;
+                        attempts.push(ExecutionAttempt {
+                            attempt: retry_number,
+                            backend: backend_name.clone(),
+                            mode: plan.mode.clone(),
+                            status: AttemptStatus::Retrying,
+                            error: None,
+                            same_peer_retry: true,
+                            replanned,
+                        });
+                        match backend.execute(request, plan).await {
+                            Ok(result) => {
+                                if let Some(attempt) = attempts.last_mut() {
+                                    attempt.status = AttemptStatus::Succeeded;
+                                }
+                                self.emit(
+                                    "recovery".into(),
+                                    format!("job {} backend {} recovered on same-peer retry", job_id, backend_name),
+                                );
+                                return Ok(result);
+                            }
+                            Err(retry_error) => {
+                                if let Some(attempt) = attempts.last_mut() {
+                                    attempt.status = AttemptStatus::Failed;
+                                    attempt.error = Some(retry_error.to_string());
+                                }
+                                last_error = Some(retry_error);
+                                continue;
+                            }
+                        }
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("no execution candidates available")))
+    }
+
+    async fn execute_distributed_attempt(
+        &self,
+        request: &JobRequest,
+        plan: &JobPlan,
+        job_id: Uuid,
+        attempts: &mut Vec<ExecutionAttempt>,
+        replanned: bool,
+    ) -> Result<JobResult> {
+        let mut partials = Vec::new();
+        let mut backends_used = Vec::new();
+        let mut max_latency = 0_u64;
+        let mut max_tokens = 0_u32;
+        let mut embeddings = None;
+        let mut saw_failure = false;
+        let mut last_error = None;
+
+        for participant in &plan.participants {
+            let Some(backend) = self
+                .inner
+                .backends
+                .iter()
+                .find(|backend| backend.name() == participant.backend)
+                .cloned()
+            else {
+                attempts.push(ExecutionAttempt {
+                    attempt: attempts.len() as u32 + 1,
+                    backend: participant.backend.clone(),
+                    mode: plan.mode.clone(),
+                    status: AttemptStatus::Skipped,
+                    error: Some("backend not available".into()),
+                    same_peer_retry: false,
+                    replanned,
+                });
+                saw_failure = true;
+                continue;
+            };
+
+            let attempt_number = attempts.len() as u32 + 1;
+            attempts.push(ExecutionAttempt {
+                attempt: attempt_number,
+                backend: participant.backend.clone(),
+                mode: plan.mode.clone(),
+                status: AttemptStatus::Planned,
+                error: None,
+                same_peer_retry: false,
+                replanned,
+            });
+
+            match backend.execute(request, plan).await {
+                Ok(result) => {
+                    if let Some(attempt) = attempts.last_mut() {
+                        attempt.status = AttemptStatus::Succeeded;
+                    }
+                    backends_used.push(result.backend.clone());
+                    max_latency = max_latency.max(result.latency_ms);
+                    max_tokens = max_tokens.max(result.tokens);
+                    if embeddings.is_none() {
+                        embeddings = result.embeddings.clone();
+                    }
+                    partials.push(format!("{}={}", participant.role, result.text.trim()));
+                }
+                Err(error) => {
+                    saw_failure = true;
+                    last_error = Some(error);
+                    if let Some(attempt) = attempts.last_mut() {
+                        attempt.status = AttemptStatus::Failed;
+                        attempt.error = last_error.as_ref().map(|err| err.to_string());
+                    }
+                    self.emit(
+                        "recovery".into(),
+                        format!(
+                            "job {} distributed participant {} failed in mode {:?}",
+                            job_id, participant.backend, plan.mode
+                        ),
+                    );
+                }
+            }
+        }
+
+        if saw_failure {
+            return Err(last_error.unwrap_or_else(|| anyhow!("distributed execution failed")));
+        }
+
+        Ok(JobResult {
+            text: format!("[{:?}] {}", plan.mode, partials.join(" | ")),
+            tokens: max_tokens,
+            latency_ms: max_latency,
+            backend: backends_used.join(","),
+            embeddings,
+        })
+    }
+
+    fn should_retry_same_peer(&self, request: &JobRequest, backend_name: &str, error: &anyhow::Error) -> bool {
+        request.determinism.high_availability
+            && self
+                .inner
+                .backends
+                .iter()
+                .find(|backend| backend.name() == backend_name)
+                .map(|backend| {
+                    backend
+                        .descriptor()
+                        .metadata
+                        .get("force_fail")
+                        .is_some_and(|mode| mode == "once")
+                        || error.to_string().contains("transient")
+                })
+                .unwrap_or(false)
+    }
+
+    fn replan_excluding(
+        &self,
+        request: &JobRequest,
+        current_plan: &JobPlan,
+        failed_backends: &BTreeSet<String>,
+    ) -> Option<JobPlan> {
+        let mut preferred_backends: Vec<String> = current_plan
+            .participants
+            .iter()
+            .map(|participant| participant.backend.clone())
+            .chain(
+                self.inner
+                    .backends
+                    .iter()
+                    .map(|backend| backend.name().to_string()),
+            )
+            .filter(|backend| !failed_backends.contains(backend))
+            .collect();
+        preferred_backends.dedup();
+        if preferred_backends.is_empty() {
+            return None;
+        }
+
+        let replanned_request = JobRequest {
+            model_id: request.model_id.clone(),
+            job_type: request.job_type.clone(),
+            prompt: request.prompt.clone(),
+            session_id: Some(current_plan.session_id),
+            preferred_backends,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            determinism: request.determinism.clone(),
+        };
+        let mut next_plan = self.plan(&replanned_request).ok()?;
+        if next_plan.participants == current_plan.participants && next_plan.mode == current_plan.mode {
+            return None;
+        }
+        next_plan.replan_generation = current_plan.replan_generation + 1;
+        Some(next_plan)
     }
 
     fn model_family(&self, model_id: &str) -> Option<&str> {
@@ -497,6 +791,35 @@ mod tests {
         config,
     };
     use std::{collections::BTreeMap, sync::Arc};
+
+    fn custom_model(parameter_count: u64, expert_count: Option<u32>) -> ModelIdentity {
+        ModelIdentity {
+            model_id: "custom-llama".into(),
+            family: "llama".into(),
+            architecture: "decoder_only_transformer".into(),
+            parameter_count,
+            tokenizer_id: "llama".into(),
+            tokenizer_hash: "tok".into(),
+            vocabulary_hash: "vocab".into(),
+            position_encoding: PositionEncoding::Rope,
+            rope_scaling: None,
+            attention_variant: AttentionVariant::Flash,
+            hidden_size: 4096,
+            layer_count: 32,
+            expert_count,
+            quantization: QuantizationDescriptor {
+                format: QuantFormat::None,
+                group_size: None,
+                scale_dtype: None,
+                zero_point_dtype: None,
+                packing_layout: None,
+                calibration: None,
+            },
+            tensor_layout: TensorLayout::RowMajorContiguous,
+            artifact_hash: "sha256:custom".into(),
+            revision: "main".into(),
+        }
+    }
 
     #[tokio::test]
     async fn synthetic_job_completes() {
@@ -610,5 +933,176 @@ mod tests {
 
         assert_eq!(record.status, JobStatus::Recovered);
         assert_eq!(record.result.unwrap().backend, "vllm");
+    }
+
+    #[tokio::test]
+    async fn retries_same_peer_for_transient_failure() {
+        let mut transient = config::backends(&Default::default())[0].descriptor();
+        transient.name = "mlx".into();
+        transient.metadata = BTreeMap::from([("force_fail".into(), "once".into())]);
+
+        let runtime = Runtime::new(
+            config::node_identity(&Default::default()),
+            vec![Arc::new(SyntheticBackend::new(transient))],
+            config::models(),
+            config::kernels(),
+            None,
+        );
+
+        let record = runtime
+            .submit_job(JobRequest {
+                model_id: "llama-3.2-3b-instruct".into(),
+                job_type: JobType::ChatCompletion,
+                prompt: "retry me".into(),
+                session_id: None,
+                preferred_backends: vec!["mlx".into()],
+                max_tokens: 16,
+                temperature: 0.0,
+                determinism: DeterminismPolicy {
+                    strict_correctness: true,
+                    deterministic: true,
+                    low_latency: true,
+                    high_availability: true,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(record.status, JobStatus::Recovered);
+        assert_eq!(record.attempts.len(), 2);
+        assert!(record.attempts[1].same_peer_retry);
+    }
+
+    #[tokio::test]
+    async fn tensor_parallel_execution_runs_across_multiple_participants() {
+        let mut mlx = config::backends(&Default::default())[0].descriptor();
+        mlx.name = "mlx".into();
+        mlx.memory_budget_mb = 24 * 1024;
+        let mut vllm = config::backends(&Default::default())[1].descriptor();
+        vllm.name = "vllm".into();
+        vllm.memory_budget_mb = 24 * 1024;
+
+        let runtime = Runtime::new(
+            config::node_identity(&Default::default()),
+            vec![
+                Arc::new(SyntheticBackend::new(mlx)),
+                Arc::new(SyntheticBackend::new(vllm)),
+            ],
+            vec![custom_model(20_000_000_000, None)],
+            config::kernels(),
+            None,
+        );
+
+        let record = runtime
+            .submit_job(JobRequest {
+                model_id: "custom-llama".into(),
+                job_type: JobType::DistributedShardExecution,
+                prompt: "tensor plan".into(),
+                session_id: None,
+                preferred_backends: vec!["mlx".into(), "vllm".into()],
+                max_tokens: 16,
+                temperature: 0.0,
+                determinism: DeterminismPolicy {
+                    strict_correctness: true,
+                    deterministic: true,
+                    low_latency: true,
+                    high_availability: true,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(record.plan.mode, ExecutionMode::TensorParallel);
+        assert_eq!(record.status, JobStatus::Completed);
+        assert_eq!(record.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hybrid_execution_runs_for_expert_models() {
+        let mut mlx = config::backends(&Default::default())[0].descriptor();
+        mlx.name = "mlx".into();
+        mlx.memory_budget_mb = 24 * 1024;
+        let mut vllm = config::backends(&Default::default())[1].descriptor();
+        vllm.name = "vllm".into();
+        vllm.memory_budget_mb = 24 * 1024;
+
+        let runtime = Runtime::new(
+            config::node_identity(&Default::default()),
+            vec![
+                Arc::new(SyntheticBackend::new(mlx)),
+                Arc::new(SyntheticBackend::new(vllm)),
+            ],
+            vec![custom_model(20_000_000_000, Some(8))],
+            config::kernels(),
+            None,
+        );
+
+        let record = runtime
+            .submit_job(JobRequest {
+                model_id: "custom-llama".into(),
+                job_type: JobType::DistributedShardExecution,
+                prompt: "hybrid plan".into(),
+                session_id: None,
+                preferred_backends: vec!["mlx".into(), "vllm".into()],
+                max_tokens: 16,
+                temperature: 0.0,
+                determinism: DeterminismPolicy {
+                    strict_correctness: true,
+                    deterministic: true,
+                    low_latency: true,
+                    high_availability: true,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(record.plan.mode, ExecutionMode::Hybrid);
+        assert_eq!(record.status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn replans_after_partial_distributed_failure() {
+        let mut failing = config::backends(&Default::default())[0].descriptor();
+        failing.name = "mlx".into();
+        failing.memory_budget_mb = 8 * 1024;
+        failing.metadata = BTreeMap::from([("force_fail".into(), "always".into())]);
+        let mut fallback = config::backends(&Default::default())[1].descriptor();
+        fallback.name = "vllm".into();
+        fallback.memory_budget_mb = 8 * 1024;
+
+        let runtime = Runtime::new(
+            config::node_identity(&Default::default()),
+            vec![
+                Arc::new(SyntheticBackend::new(failing)),
+                Arc::new(SyntheticBackend::new(fallback)),
+            ],
+            vec![custom_model(20_000_000_000, None)],
+            config::kernels(),
+            None,
+        );
+
+        let record = runtime
+            .submit_job(JobRequest {
+                model_id: "custom-llama".into(),
+                job_type: JobType::DistributedShardExecution,
+                prompt: "replan me".into(),
+                session_id: None,
+                preferred_backends: vec!["mlx".into(), "vllm".into()],
+                max_tokens: 16,
+                temperature: 0.0,
+                determinism: DeterminismPolicy {
+                    strict_correctness: true,
+                    deterministic: true,
+                    low_latency: true,
+                    high_availability: true,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(record.status, JobStatus::Recovered);
+        assert!(record.plan.replan_generation > 0);
+        assert!(record.attempts.iter().any(|attempt| attempt.replanned));
+        assert!(record.attempts.iter().any(|attempt| attempt.status == AttemptStatus::Failed));
     }
 }

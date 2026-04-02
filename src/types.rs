@@ -171,6 +171,10 @@ pub struct ModelIdentity {
 pub struct BackendDescriptor {
     pub name: String,
     pub version: String,
+    pub trust_level: TrustLevel,
+    pub topology: BackendTopologyHints,
+    pub memory_budget_mb: u64,
+    pub attestation: Option<BackendAttestation>,
     pub execution_modes: Vec<ExecutionMode>,
     pub model_families: Vec<String>,
     pub quantization: Vec<QuantFormat>,
@@ -183,6 +187,22 @@ pub struct BackendDescriptor {
     pub batching: bool,
     pub extensions: Vec<String>,
     pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct BackendTopologyHints {
+    pub locality: String,
+    pub zone: String,
+    pub hop_count: u32,
+    pub base_latency_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct BackendAttestation {
+    pub format: String,
+    pub signer: String,
+    pub artifact_hash: String,
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -325,6 +345,7 @@ pub struct PlannedParticipant {
     pub backend: String,
     pub role: String,
     pub model_id: String,
+    pub cost: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -336,6 +357,9 @@ pub struct JobPlan {
     pub tensor_layout: TensorLayout,
     pub cache: Option<CacheDescriptor>,
     pub fallback_modes: Vec<ExecutionMode>,
+    pub estimated_cost: u64,
+    pub replan_generation: u32,
+    pub partial_failure_tolerance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -371,6 +395,28 @@ pub struct JobRecord {
     pub plan: JobPlan,
     pub result: Option<JobResult>,
     pub error: Option<String>,
+    pub attempts: Vec<ExecutionAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStatus {
+    Planned,
+    Retrying,
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ExecutionAttempt {
+    pub attempt: u32,
+    pub backend: String,
+    pub mode: ExecutionMode,
+    pub status: AttemptStatus,
+    pub error: Option<String>,
+    pub same_peer_retry: bool,
+    pub replanned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

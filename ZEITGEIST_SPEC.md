@@ -76,8 +76,13 @@ Framing:
 ## Execution Semantics
 
 - Job submission plans execution against registered backends.
+- Planning excludes untrusted backends from live execution.
+- Planning orders participants by a topology-aware cost model.
+- Planning repartitions under memory pressure into tensor-parallel or hybrid execution when aggregate backend memory can satisfy the model.
 - The primary backend is attempted first.
+- Transient same-peer retry is supported for retryable backend failures.
 - If the primary backend fails, alternate peers are attempted.
+- If a distributed execution partially fails, the runtime records per-attempt results and actively replans onto the remaining backend set.
 - If no alternate peer was explicitly requested but fallback-compatible backends exist, the runtime degrades to fallback execution automatically.
 - Successful failover is surfaced as `recovered`.
 - Streaming execution emits SSE chunks and can be cancelled through the cancellation endpoint.
@@ -106,6 +111,12 @@ Framing:
 - Synthetic backends for deterministic certification
 - MLX-shaped backend interface
 - vLLM OpenAI-compatible proxy-shaped backend interface
+- Execution modes implemented in the runtime:
+  - solo
+  - routed serving
+  - tensor parallel
+  - expert parallel
+  - hybrid distributed execution
 - Backend failover and degrade-to-fallback implemented in runtime orchestration
 
 ## Verification Surfaces
